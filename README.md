@@ -113,10 +113,3 @@ complete(
 
 ```
 
-## License
-
-MIT
-
-```
-
-```
