@@ -1,0 +1,22 @@
+Metadata-Version: 2.4
+Name: litlm
+Version: 0.1.5
+Summary: Minimalist litellm wrapper for simpler requests and better openrouter support
+Home-page: https://github.com/sileod/litlm
+Author: Damien Sileo
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.6
+Description-Content-Type: text/markdown
+Requires-Dist: litellm
+Dynamic: author
+Dynamic: classifier
+Dynamic: description
+Dynamic: description-content-type
+Dynamic: home-page
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
+
+# litlm
