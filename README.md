@@ -12,7 +12,10 @@ pip install litlm
 ## Quick Start
 
 ```python
+import os
 from litlm import complete
+
+os.environ["OPENROUTER_API_KEY"] = "sk-or-..." 
 
 # 1. Simple String (Synchronous feel, but Async under the hood)
 res = complete("What is 2+2?")
