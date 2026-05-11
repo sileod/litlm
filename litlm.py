@@ -14,6 +14,19 @@ from pathlib import Path
 import appdirs
 import uuid
 
+# suppression of annoying messages
+import os, warnings, logging
+os.environ["PYDANTIC_ERRORS_OMIT_URL"] = "1"
+warnings.filterwarnings("ignore", category=UserWarning, module="pydantic.*")
+warnings.filterwarnings("ignore", message=".*Expected.*serialized value may not be as expected.*")
+logging.getLogger("LiteLLM").setLevel(logging.ERROR)
+import asyncio
+import json as jsonlib
+import nest_asyncio; nest_asyncio.apply()
+import litellm
+litellm.suppress_debug_info = True
+from litellm import acompletion, Cache
+
 # --- Configuration & Cache ---
 CACHE_DIR = Path(appdirs.user_cache_dir("litlm"))
 _CACHE_READY = False
