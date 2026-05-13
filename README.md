@@ -16,6 +16,8 @@ import os
 from litlm import complete, cost_breakdown
 
 os.environ["OPENROUTER_API_KEY"] = "sk-or-..." 
+os.environ["NVIDIA_NIM_API_KEY"] = "nvapi-..."  # Optional, used for the first NIM fallback
+os.environ["NVIDIA_NIM_API_BASE"] = "https://integrate.api.nvidia.com/v1/"  # Optional
 
 # 1. Simple String (Synchronous feel, but Async under the hood)
 res = complete("What is 2+2?")

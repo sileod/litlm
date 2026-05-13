@@ -12,20 +12,21 @@ from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 import appdirs
-import uuid
+import os, logging
 
 # suppression of annoying messages
-import os, warnings, logging
 os.environ["PYDANTIC_ERRORS_OMIT_URL"] = "1"
 warnings.filterwarnings("ignore", category=UserWarning, module="pydantic.*")
 warnings.filterwarnings("ignore", message=".*Expected.*serialized value may not be as expected.*")
 logging.getLogger("LiteLLM").setLevel(logging.ERROR)
-import asyncio
-import json as jsonlib
-import nest_asyncio; nest_asyncio.apply()
-import litellm
 litellm.suppress_debug_info = True
-from litellm import acompletion, Cache
+
+def extract_answer(s, tag="answer"):
+    first_tag, last_tag = f"<{tag}>", f"</{tag}>"
+    if first_tag not in s or last_tag not in s:
+        return s
+    return s.split(first_tag)[1].split(last_tag)[0].strip()
+
 
 # --- Configuration & Cache ---
 CACHE_DIR = Path(appdirs.user_cache_dir("litlm"))
@@ -34,6 +35,11 @@ _CACHE_READY = False
 _HISTORY = []
 _COSTS = []
 _MODEL_USED = {}
+_NVIDIA_PROVIDER_ALIASES = {
+    "deepseek": "deepseek-ai",
+}
+_NVIDIA_MODELS_TTL = timedelta(days=1)
+_NVIDIA_MODELS_CACHE = {}
 
 # --- Helpers ---
 def _ensure_cache():
@@ -49,7 +55,7 @@ def validate_args(kwargs):
     valid = set(sig.parameters.keys()) | {
         "caching", "num_retries", "max_tokens", "response_format", "extra_headers", 
         "base_url", "api_key", "api_base", "deployment_id", "timeout",
-        "cache_control", "extra_body"
+        "cache_control", "extra_body", "reasoning"
     }
     for k in kwargs:
         if k not in valid:
@@ -59,6 +65,22 @@ def validate_args(kwargs):
 def _fetch_or_models():
     try: return [m['id'] for m in requests.get("https://openrouter.ai/api/v1/models", timeout=2).json()['data']]
     except: return []
+
+def _fetch_nvidia_models(api_base, api_key):
+    if not api_key: return []
+    now = datetime.now()
+    cache_key = (api_base, api_key)
+    cached = _NVIDIA_MODELS_CACHE.get(cache_key)
+    if cached and now - cached[0] < _NVIDIA_MODELS_TTL:
+        return cached[1]
+    try:
+        url = f"{api_base.rstrip('/')}/models"
+        r = requests.get(url, headers={"Authorization": f"Bearer {api_key}"}, timeout=2)
+        models = [m["id"] for m in r.json().get("data", [])]
+        _NVIDIA_MODELS_CACHE[cache_key] = (now, models)
+        return models
+    except Exception:
+        return cached[1] if cached else []
 
 def _strip_prefix(model):
     for prefix in ("openrouter/", "nvidia_nim/"):
@@ -88,14 +110,44 @@ def _uniq(items):
         if item not in out: out.append(item)
     return out
 
+def _nvidia_slug(model):
+    if "/" not in model: return model
+    provider, rest = model.split("/", 1)
+    return f"{_NVIDIA_PROVIDER_ALIASES.get(provider, provider)}/{rest}"
+
 def _fallback_models(model):
+    if model.startswith("openrouter/"):
+        return [model]
+    if model.startswith("nvidia_nim/"):
+        return [f"nvidia_nim/{_nvidia_slug(_strip_prefix(model))}"]
+    if "/" in model:
+        return [f"openrouter/{model}"]
     base = _strip_free(_strip_prefix(model))
     if "/" not in model and _fetch_or_models() and not _known_or_model(model):
         raise ValueError(f"Unknown model '{model}'. Use an exact provider/model name to bypass fuzzy matching.")
-    free_or = f"openrouter/{_resolve_or_model(base, free=True)}"
-    paid_or = f"openrouter/{_resolve_or_model(base)}"
-    nvidia = model if model.startswith("nvidia_nim/") else f"nvidia_nim/{base}"
-    return _uniq([nvidia, free_or, paid_or])
+    free_slug = _resolve_or_model(base, free=True)
+    paid_slug = _resolve_or_model(base)
+    free_or = f"openrouter/{free_slug}"
+    paid_or = f"openrouter/{paid_slug}"
+    nvidia_slug = _nvidia_slug(base if model.startswith("nvidia_nim/") else paid_slug)
+    nvidia_models = _fetch_nvidia_models(
+        os.environ.get("NVIDIA_NIM_API_BASE", "https://integrate.api.nvidia.com/v1"),
+        os.environ.get("NVIDIA_NIM_API_KEY"),
+    )
+    nvidia = [f"nvidia_nim/{nvidia_slug}"] if nvidia_slug in nvidia_models else []
+    return _uniq(nvidia + [free_or, paid_or])
+
+def _with_provider_env(model, kwargs):
+    call_kwargs = dict(kwargs)
+    if model.startswith("nvidia_nim/"):
+        call_kwargs.setdefault("api_key", os.environ.get("NVIDIA_NIM_API_KEY"))
+        if "api_base" not in call_kwargs and "base_url" not in call_kwargs:
+            call_kwargs["api_base"] = os.environ.get("NVIDIA_NIM_API_BASE")
+    elif model.startswith("openrouter/"):
+        call_kwargs.setdefault("api_key", os.environ.get("OPENROUTER_API_KEY"))
+        if "api_base" not in call_kwargs and "base_url" not in call_kwargs:
+            call_kwargs["api_base"] = os.environ.get("OPENROUTER_API_BASE")
+    return {k: v for k, v in call_kwargs.items() if v is not None}
 
 def _cache_control(prompt_cache, cache_control):
     if cache_control is not None: return cache_control
@@ -185,7 +237,7 @@ def complete(inputs, model="openrouter/openai/gpt-4.1-nano", system=None, json=F
         async def _one(r):
             last = None
             for m in models:
-                call_kwargs = dict(kwargs)
+                call_kwargs = _with_provider_env(m, kwargs)
                 if cc and m.startswith("openrouter/"): call_kwargs["cache_control"] = cc
                 try:
                     res = await acompletion(model=m, messages=r, caching=caching, num_retries=num_retries, max_tokens=max_tokens, **call_kwargs)
