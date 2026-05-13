@@ -137,12 +137,27 @@ def _fallback_models(model):
     nvidia = [f"nvidia_nim/{nvidia_slug}"] if nvidia_slug in nvidia_models else []
     return _uniq(nvidia + [free_or, paid_or])
 
+def _normalize_nvidia_reasoning(call_kwargs):
+    reasoning = call_kwargs.pop("reasoning", None)
+    effort = call_kwargs.pop("reasoning_effort", None)
+    if effort is None and isinstance(reasoning, dict):
+        effort = reasoning.get("effort")
+    if not effort:
+        return call_kwargs
+
+    extra_body = dict(call_kwargs.get("extra_body") or {})
+    extra_body.setdefault("reasoning_effort", effort)
+    call_kwargs["extra_body"] = extra_body
+    return call_kwargs
+
 def _with_provider_env(model, kwargs):
     call_kwargs = dict(kwargs)
+    call_kwargs.pop("debug", None)
     if model.startswith("nvidia_nim/"):
         call_kwargs.setdefault("api_key", os.environ.get("NVIDIA_NIM_API_KEY"))
         if "api_base" not in call_kwargs and "base_url" not in call_kwargs:
             call_kwargs["api_base"] = os.environ.get("NVIDIA_NIM_API_BASE")
+        call_kwargs = _normalize_nvidia_reasoning(call_kwargs)
     elif model.startswith("openrouter/"):
         call_kwargs.setdefault("api_key", os.environ.get("OPENROUTER_API_KEY"))
         if "api_base" not in call_kwargs and "base_url" not in call_kwargs:
@@ -209,7 +224,8 @@ class Text(str):
 
 def get_history(idx=-1): return _HISTORY[idx] if _HISTORY else None
 
-def complete(inputs, model="openrouter/openai/gpt-4.1-nano", system=None, json=False, show_progress=True, caching=False, prompt_cache=False, cache_control=None, num_retries=3, max_tokens=1024, **kwargs):
+def complete(inputs, model="openrouter/openai/gpt-4.1-nano", system=None, json=False, show_progress=True, caching=False, prompt_cache=False, cache_control=None, num_retries=3, max_tokens=1024, timeout=60, debug=False, **kwargs):
+    debug = bool(debug or kwargs.pop("debug", False))
     validate_args(kwargs)
     if caching: _ensure_cache()
     if json and "response_format" not in kwargs: kwargs["response_format"] = {"type": "json_object"}
@@ -233,6 +249,8 @@ def complete(inputs, model="openrouter/openai/gpt-4.1-nano", system=None, json=F
     # Async Runner
     async def _runner():
         models = _fallback_models(model)
+        if debug:
+            print(f"litlm fallback models: {models}")
         cc = _cache_control(prompt_cache, cache_control)
         async def _one(r):
             last = None
@@ -240,12 +258,19 @@ def complete(inputs, model="openrouter/openai/gpt-4.1-nano", system=None, json=F
                 call_kwargs = _with_provider_env(m, kwargs)
                 if cc and m.startswith("openrouter/"): call_kwargs["cache_control"] = cc
                 try:
-                    res = await acompletion(model=m, messages=r, caching=caching, num_retries=num_retries, max_tokens=max_tokens, **call_kwargs)
+                    if debug:
+                        print(f"litlm trying model: {m}")
+                    coro = acompletion(model=m, messages=r, caching=caching, num_retries=num_retries, max_tokens=max_tokens, timeout=timeout, **call_kwargs)
+                    res = await asyncio.wait_for(coro, timeout=timeout) if timeout else await coro
                     try: res._litlm_model_used = m
                     except Exception: pass
                     _record_cost(res, m)
+                    if debug:
+                        print(f"litlm succeeded with model: {m}")
                     return res
                 except Exception as e:
+                    if debug:
+                        print(f"litlm failed with model {m}: {type(e).__name__}: {e}")
                     last = e
             raise last
         tasks = [_one(r) for r in reqs]
