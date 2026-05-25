@@ -231,7 +231,7 @@ class Text(str):
 
 def get_history(idx=-1): return _HISTORY[idx] if _HISTORY else None
 
-def complete(inputs, model="openrouter/openai/gpt-4.1-nano", system=None, json=False, show_progress=True, caching=False, prompt_cache=False, cache_control=None, num_retries=3, max_tokens=1024, timeout=60, debug=False, **kwargs):
+def complete(inputs, model="openrouter/openai/gpt-4.1-nano", system=None, json=False, show_progress=True, caching=False, prompt_cache=False, cache_control=None, num_retries=3, max_tokens=1024, timeout=60, debug=False, max_rpm=None, **kwargs):
     debug = bool(debug or kwargs.pop("debug", False))
     validate_args(kwargs)
     if caching: _ensure_cache()
@@ -259,7 +259,16 @@ def complete(inputs, model="openrouter/openai/gpt-4.1-nano", system=None, json=F
         if debug:
             print(f"litlm fallback models: {models}")
         cc = _cache_control(prompt_cache, cache_control)
+        rpm_lock = asyncio.Lock()
+        rpm_next = [0.0]
         async def _one(r):
+            if max_rpm:
+                async with rpm_lock:
+                    now = asyncio.get_event_loop().time()
+                    wait = rpm_next[0] - now
+                    if wait > 0:
+                        await asyncio.sleep(wait)
+                    rpm_next[0] = asyncio.get_event_loop().time() + 60.0 / max_rpm
             last = None
             for m in models:
                 call_kwargs = _with_provider_env(m, kwargs)
