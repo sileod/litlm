@@ -37,6 +37,7 @@ _COSTS = []
 _MODEL_USED = {}
 _NVIDIA_PROVIDER_ALIASES = {
     "deepseek": "deepseek-ai",
+    "meta-llama": "meta",
 }
 _NVIDIA_MODELS_TTL = timedelta(days=1)
 _NVIDIA_MODELS_CACHE = {}
@@ -120,9 +121,15 @@ def _fallback_models(model):
         return [model]
     if model.startswith("nvidia_nim/"):
         return [f"nvidia_nim/{_nvidia_slug(_strip_prefix(model))}"]
-    if "/" in model:
-        return [f"openrouter/{model}"]
     base = _strip_free(_strip_prefix(model))
+    if "/" in base:
+        nvidia_slug = _nvidia_slug(base)
+        nvidia_models = _fetch_nvidia_models(
+            os.environ.get("NVIDIA_NIM_API_BASE", "https://integrate.api.nvidia.com/v1"),
+            os.environ.get("NVIDIA_NIM_API_KEY"),
+        )
+        nvidia = [f"nvidia_nim/{nvidia_slug}"] if nvidia_slug in nvidia_models else []
+        return _uniq(nvidia + [f"openrouter/{model}"])
     if "/" not in model and _fetch_or_models() and not _known_or_model(model):
         raise ValueError(f"Unknown model '{model}'. Use an exact provider/model name to bypass fuzzy matching.")
     free_slug = _resolve_or_model(base, free=True)
