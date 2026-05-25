@@ -116,33 +116,38 @@ def _nvidia_slug(model):
     provider, rest = model.split("/", 1)
     return f"{_NVIDIA_PROVIDER_ALIASES.get(provider, provider)}/{rest}"
 
+def _resolve_nvidia_model(slug, nvidia_models):
+    """Find the best matching NVIDIA NIM model for a slug, using exact then substring match."""
+    if slug in nvidia_models:
+        return slug
+    model_part = slug.split("/", 1)[-1]
+    candidates = [m for m in nvidia_models if model_part in m.split("/", 1)[-1]]
+    if not candidates:
+        return None
+    exact = [m for m in candidates if m.split("/", 1)[-1] == model_part]
+    return sorted(exact or candidates, key=len)[0]
+
 def _fallback_models(model):
     if model.startswith("openrouter/"):
         return [model]
     if model.startswith("nvidia_nim/"):
         return [f"nvidia_nim/{_nvidia_slug(_strip_prefix(model))}"]
     base = _strip_free(_strip_prefix(model))
-    if "/" in base:
-        nvidia_slug = _nvidia_slug(base)
-        nvidia_models = _fetch_nvidia_models(
-            os.environ.get("NVIDIA_NIM_API_BASE", "https://integrate.api.nvidia.com/v1"),
-            os.environ.get("NVIDIA_NIM_API_KEY"),
-        )
-        nvidia = [f"nvidia_nim/{nvidia_slug}"] if nvidia_slug in nvidia_models else []
-        return _uniq(nvidia + [f"openrouter/{model}"])
-    if "/" not in model and _fetch_or_models() and not _known_or_model(model):
-        raise ValueError(f"Unknown model '{model}'. Use an exact provider/model name to bypass fuzzy matching.")
-    free_slug = _resolve_or_model(base, free=True)
-    paid_slug = _resolve_or_model(base)
-    free_or = f"openrouter/{free_slug}"
-    paid_or = f"openrouter/{paid_slug}"
-    nvidia_slug = _nvidia_slug(base if model.startswith("nvidia_nim/") else paid_slug)
     nvidia_models = _fetch_nvidia_models(
         os.environ.get("NVIDIA_NIM_API_BASE", "https://integrate.api.nvidia.com/v1"),
         os.environ.get("NVIDIA_NIM_API_KEY"),
     )
-    nvidia = [f"nvidia_nim/{nvidia_slug}"] if nvidia_slug in nvidia_models else []
-    return _uniq(nvidia + [free_or, paid_or])
+    if "/" in base:
+        resolved = _resolve_nvidia_model(_nvidia_slug(base), nvidia_models)
+        nvidia = [f"nvidia_nim/{resolved}"] if resolved else []
+        return _uniq(nvidia + [f"openrouter/{model}"])
+    if _fetch_or_models() and not _known_or_model(model):
+        raise ValueError(f"Unknown model '{model}'. Use an exact provider/model name to bypass fuzzy matching.")
+    free_slug = _resolve_or_model(base, free=True)
+    paid_slug = _resolve_or_model(base)
+    resolved = _resolve_nvidia_model(_nvidia_slug(paid_slug), nvidia_models)
+    nvidia = [f"nvidia_nim/{resolved}"] if resolved else []
+    return _uniq(nvidia + [f"openrouter/{free_slug}", f"openrouter/{paid_slug}"])
 
 def _normalize_nvidia_reasoning(call_kwargs):
     reasoning = call_kwargs.pop("reasoning", None)
