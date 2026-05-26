@@ -37,6 +37,7 @@ _COSTS = []
 _MODEL_USED = {}
 _NVIDIA_PROVIDER_ALIASES = {
     "deepseek": "deepseek-ai",
+    "meta-llama": "meta",
 }
 _NVIDIA_MODELS_TTL = timedelta(days=1)
 _NVIDIA_MODELS_CACHE = {}
@@ -53,9 +54,9 @@ def validate_args(kwargs):
     """Warns on likely typos in arguments."""
     sig = inspect.signature(acompletion)
     valid = set(sig.parameters.keys()) | {
-        "caching", "num_retries", "max_tokens", "response_format", "extra_headers", 
+        "caching", "num_retries", "max_tokens", "response_format", "extra_headers",
         "base_url", "api_key", "api_base", "deployment_id", "timeout",
-        "cache_control", "extra_body", "reasoning"
+        "cache_control", "extra_body", "reasoning", "reasoning_effort", "thinking_budget"
     }
     for k in kwargs:
         if k not in valid:
@@ -115,39 +116,65 @@ def _nvidia_slug(model):
     provider, rest = model.split("/", 1)
     return f"{_NVIDIA_PROVIDER_ALIASES.get(provider, provider)}/{rest}"
 
-def _fallback_models(model):
+def _resolve_nvidia_model(slug, nvidia_models):
+    """Find an unambiguous NVIDIA NIM model: exact match, or exactly one substring match on model name."""
+    if slug in nvidia_models:
+        return slug
+    model_part = slug.split("/", 1)[-1]
+    candidates = [m for m in nvidia_models if model_part in m.split("/", 1)[-1]]
+    if len(candidates) == 1:
+        return candidates[0]
+    return None  # not found or ambiguous
+
+def _fallback_models(model, budget=False):
     if model.startswith("openrouter/"):
         return [model]
     if model.startswith("nvidia_nim/"):
         return [f"nvidia_nim/{_nvidia_slug(_strip_prefix(model))}"]
-    if "/" in model:
-        return [f"openrouter/{model}"]
+    explicit_free = model.endswith(":free")
     base = _strip_free(_strip_prefix(model))
-    if "/" not in model and _fetch_or_models() and not _known_or_model(model):
-        raise ValueError(f"Unknown model '{model}'. Use an exact provider/model name to bypass fuzzy matching.")
-    free_slug = _resolve_or_model(base, free=True)
-    paid_slug = _resolve_or_model(base)
-    free_or = f"openrouter/{free_slug}"
-    paid_or = f"openrouter/{paid_slug}"
-    nvidia_slug = _nvidia_slug(base if model.startswith("nvidia_nim/") else paid_slug)
+    if explicit_free:
+        return [f"openrouter/{base}:free"]
+    or_model_set = set(_fetch_or_models())
     nvidia_models = _fetch_nvidia_models(
         os.environ.get("NVIDIA_NIM_API_BASE", "https://integrate.api.nvidia.com/v1"),
         os.environ.get("NVIDIA_NIM_API_KEY"),
     )
-    nvidia = [f"nvidia_nim/{nvidia_slug}"] if nvidia_slug in nvidia_models else []
-    return _uniq(nvidia + [free_or, paid_or])
+    if "/" in base:
+        resolved = _resolve_nvidia_model(_nvidia_slug(base), nvidia_models)
+        nvidia = [f"nvidia_nim/{resolved}"] if resolved else []
+        free_or = [f"openrouter/{base}:free"] if f"{base}:free" in or_model_set else []
+        paid_or = [f"openrouter/{base}"]
+        if budget:
+            return _uniq(free_or + nvidia + paid_or)
+        return _uniq(nvidia + free_or + paid_or)
+    if or_model_set and not _known_or_model(model):
+        raise ValueError(f"Unknown model '{model}'. Use an exact provider/model name to bypass fuzzy matching.")
+    free_slug = _resolve_or_model(base, free=True)
+    paid_slug = _resolve_or_model(base)
+    free_or = [f"openrouter/{free_slug}"] if free_slug in or_model_set else []
+    paid_or = [f"openrouter/{paid_slug}"]
+    resolved = _resolve_nvidia_model(_nvidia_slug(paid_slug), nvidia_models)
+    nvidia = [f"nvidia_nim/{resolved}"] if resolved else []
+    if budget:
+        return _uniq(free_or + nvidia + paid_or)
+    return _uniq(nvidia + free_or + paid_or)
 
-def _normalize_nvidia_reasoning(call_kwargs):
+def _normalize_reasoning(call_kwargs, for_nvidia=False):
     reasoning = call_kwargs.pop("reasoning", None)
     effort = call_kwargs.pop("reasoning_effort", None)
+    thinking_budget = call_kwargs.pop("thinking_budget", None)
     if effort is None and isinstance(reasoning, dict):
         effort = reasoning.get("effort")
-    if not effort:
-        return call_kwargs
-
     extra_body = dict(call_kwargs.get("extra_body") or {})
-    extra_body.setdefault("reasoning_effort", effort)
-    call_kwargs["extra_body"] = extra_body
+    if for_nvidia and effort:
+        extra_body.setdefault("reasoning_effort", effort)
+    elif reasoning is not None:
+        call_kwargs["reasoning"] = reasoning  # pass through to OR as-is
+    if thinking_budget is not None:
+        extra_body["thinking_budget"] = thinking_budget
+    if extra_body:
+        call_kwargs["extra_body"] = extra_body
     return call_kwargs
 
 def _with_provider_env(model, kwargs):
@@ -157,11 +184,12 @@ def _with_provider_env(model, kwargs):
         call_kwargs.setdefault("api_key", os.environ.get("NVIDIA_NIM_API_KEY"))
         if "api_base" not in call_kwargs and "base_url" not in call_kwargs:
             call_kwargs["api_base"] = os.environ.get("NVIDIA_NIM_API_BASE")
-        call_kwargs = _normalize_nvidia_reasoning(call_kwargs)
+        call_kwargs = _normalize_reasoning(call_kwargs, for_nvidia=True)
     elif model.startswith("openrouter/"):
         call_kwargs.setdefault("api_key", os.environ.get("OPENROUTER_API_KEY"))
         if "api_base" not in call_kwargs and "base_url" not in call_kwargs:
             call_kwargs["api_base"] = os.environ.get("OPENROUTER_API_BASE")
+        call_kwargs = _normalize_reasoning(call_kwargs, for_nvidia=False)
     return {k: v for k, v in call_kwargs.items() if v is not None}
 
 def _cache_control(prompt_cache, cache_control):
@@ -224,7 +252,7 @@ class Text(str):
 
 def get_history(idx=-1): return _HISTORY[idx] if _HISTORY else None
 
-def complete(inputs, model="openrouter/openai/gpt-4.1-nano", system=None, json=False, show_progress=True, caching=False, prompt_cache=False, cache_control=None, num_retries=3, max_tokens=1024, timeout=60, debug=False, **kwargs):
+def complete(inputs, model="openrouter/openai/gpt-4.1-nano", system=None, json=False, show_progress=True, caching=False, prompt_cache=False, cache_control=None, num_retries=3, max_tokens=1024, timeout=60, debug=False, max_rpm=None, budget=False, **kwargs):
     debug = bool(debug or kwargs.pop("debug", False))
     validate_args(kwargs)
     if caching: _ensure_cache()
@@ -248,11 +276,20 @@ def complete(inputs, model="openrouter/openai/gpt-4.1-nano", system=None, json=F
 
     # Async Runner
     async def _runner():
-        models = _fallback_models(model)
+        models = _fallback_models(model, budget=budget)
         if debug:
             print(f"litlm fallback models: {models}")
         cc = _cache_control(prompt_cache, cache_control)
+        rpm_lock = asyncio.Lock()
+        rpm_next = [0.0]
         async def _one(r):
+            if max_rpm:
+                async with rpm_lock:
+                    now = asyncio.get_event_loop().time()
+                    wait = rpm_next[0] - now
+                    if wait > 0:
+                        await asyncio.sleep(wait)
+                    rpm_next[0] = asyncio.get_event_loop().time() + 60.0 / max_rpm
             last = None
             for m in models:
                 call_kwargs = _with_provider_env(m, kwargs)
