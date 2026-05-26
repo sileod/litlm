@@ -54,9 +54,9 @@ def validate_args(kwargs):
     """Warns on likely typos in arguments."""
     sig = inspect.signature(acompletion)
     valid = set(sig.parameters.keys()) | {
-        "caching", "num_retries", "max_tokens", "response_format", "extra_headers", 
+        "caching", "num_retries", "max_tokens", "response_format", "extra_headers",
         "base_url", "api_key", "api_base", "deployment_id", "timeout",
-        "cache_control", "extra_body", "reasoning"
+        "cache_control", "extra_body", "reasoning", "reasoning_effort", "thinking_budget"
     }
     for k in kwargs:
         if k not in valid:
@@ -160,17 +160,21 @@ def _fallback_models(model, budget=False):
         return _uniq(free_or + nvidia + paid_or)
     return _uniq(nvidia + free_or + paid_or)
 
-def _normalize_nvidia_reasoning(call_kwargs):
+def _normalize_reasoning(call_kwargs, for_nvidia=False):
     reasoning = call_kwargs.pop("reasoning", None)
     effort = call_kwargs.pop("reasoning_effort", None)
+    thinking_budget = call_kwargs.pop("thinking_budget", None)
     if effort is None and isinstance(reasoning, dict):
         effort = reasoning.get("effort")
-    if not effort:
-        return call_kwargs
-
     extra_body = dict(call_kwargs.get("extra_body") or {})
-    extra_body.setdefault("reasoning_effort", effort)
-    call_kwargs["extra_body"] = extra_body
+    if for_nvidia and effort:
+        extra_body.setdefault("reasoning_effort", effort)
+    elif reasoning is not None:
+        call_kwargs["reasoning"] = reasoning  # pass through to OR as-is
+    if thinking_budget is not None:
+        extra_body["thinking_budget"] = thinking_budget
+    if extra_body:
+        call_kwargs["extra_body"] = extra_body
     return call_kwargs
 
 def _with_provider_env(model, kwargs):
@@ -180,11 +184,12 @@ def _with_provider_env(model, kwargs):
         call_kwargs.setdefault("api_key", os.environ.get("NVIDIA_NIM_API_KEY"))
         if "api_base" not in call_kwargs and "base_url" not in call_kwargs:
             call_kwargs["api_base"] = os.environ.get("NVIDIA_NIM_API_BASE")
-        call_kwargs = _normalize_nvidia_reasoning(call_kwargs)
+        call_kwargs = _normalize_reasoning(call_kwargs, for_nvidia=True)
     elif model.startswith("openrouter/"):
         call_kwargs.setdefault("api_key", os.environ.get("OPENROUTER_API_KEY"))
         if "api_base" not in call_kwargs and "base_url" not in call_kwargs:
             call_kwargs["api_base"] = os.environ.get("OPENROUTER_API_BASE")
+        call_kwargs = _normalize_reasoning(call_kwargs, for_nvidia=False)
     return {k: v for k, v in call_kwargs.items() if v is not None}
 
 def _cache_control(prompt_cache, cache_control):
