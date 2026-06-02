@@ -55,7 +55,7 @@ def validate_args(kwargs):
     valid = set(sig.parameters.keys()) | {
         "caching", "num_retries", "max_tokens", "response_format", "extra_headers", 
         "base_url", "api_key", "api_base", "deployment_id", "timeout",
-        "cache_control", "extra_body", "reasoning"
+        "cache_control", "extra_body", "reasoning", "reasoning_effort"
     }
     for k in kwargs:
         if k not in valid:
@@ -137,7 +137,7 @@ def _fallback_models(model):
     nvidia = [f"nvidia_nim/{nvidia_slug}"] if nvidia_slug in nvidia_models else []
     return _uniq(nvidia + [free_or, paid_or])
 
-def _normalize_nvidia_reasoning(call_kwargs):
+def _normalize_reasoning(call_kwargs):
     reasoning = call_kwargs.pop("reasoning", None)
     effort = call_kwargs.pop("reasoning_effort", None)
     if effort is None and isinstance(reasoning, dict):
@@ -150,6 +150,31 @@ def _normalize_nvidia_reasoning(call_kwargs):
     call_kwargs["extra_body"] = extra_body
     return call_kwargs
 
+def _drop_reasoning_effort(call_kwargs):
+    changed = False
+    if "reasoning_effort" in call_kwargs:
+        call_kwargs.pop("reasoning_effort", None)
+        changed = True
+    extra_body = call_kwargs.get("extra_body")
+    if isinstance(extra_body, dict) and "reasoning_effort" in extra_body:
+        extra_body = dict(extra_body)
+        extra_body.pop("reasoning_effort", None)
+        if extra_body:
+            call_kwargs["extra_body"] = extra_body
+        else:
+            call_kwargs.pop("extra_body", None)
+        changed = True
+    return changed
+
+def _mentions_unsupported_reasoning_effort(exc):
+    msg = str(exc).lower()
+    if "reasoning_effort" not in msg:
+        return False
+    return any(
+        token in msg
+        for token in ("unsupported", "not supported", "unrecognized", "unknown", "invalid", "extra inputs")
+    ) or ("literal_error" in msg and "input should be" in msg)
+
 def _with_provider_env(model, kwargs):
     call_kwargs = dict(kwargs)
     call_kwargs.pop("debug", None)
@@ -157,11 +182,12 @@ def _with_provider_env(model, kwargs):
         call_kwargs.setdefault("api_key", os.environ.get("NVIDIA_NIM_API_KEY"))
         if "api_base" not in call_kwargs and "base_url" not in call_kwargs:
             call_kwargs["api_base"] = os.environ.get("NVIDIA_NIM_API_BASE")
-        call_kwargs = _normalize_nvidia_reasoning(call_kwargs)
+        call_kwargs = _normalize_reasoning(call_kwargs)
     elif model.startswith("openrouter/"):
         call_kwargs.setdefault("api_key", os.environ.get("OPENROUTER_API_KEY"))
         if "api_base" not in call_kwargs and "base_url" not in call_kwargs:
             call_kwargs["api_base"] = os.environ.get("OPENROUTER_API_BASE")
+        call_kwargs = _normalize_reasoning(call_kwargs)
     return {k: v for k, v in call_kwargs.items() if v is not None}
 
 def _cache_control(prompt_cache, cache_control):
@@ -257,22 +283,48 @@ def complete(inputs, model="openrouter/openai/gpt-4.1-nano", system=None, json=F
             for m in models:
                 call_kwargs = _with_provider_env(m, kwargs)
                 if cc and m.startswith("openrouter/"): call_kwargs["cache_control"] = cc
-                try:
-                    if debug:
-                        print(f"litlm trying model: {m}")
-                    coro = acompletion(model=m, messages=r, caching=caching, num_retries=num_retries, max_tokens=max_tokens, timeout=timeout, **call_kwargs)
-                    res = await asyncio.wait_for(coro, timeout=timeout) if timeout else await coro
-                    try: res._litlm_model_used = m
-                    except Exception: pass
-                    _record_cost(res, m)
-                    if debug:
-                        print(f"litlm succeeded with model: {m}")
-                    return res
-                except Exception as e:
-                    if debug:
-                        print(f"litlm failed with model {m}: {type(e).__name__}: {e}")
-                    last = e
-            raise last
+
+                # Retry loop for local parameter dropping (0 network requests wasted)
+                while True:
+                    try:
+                        if debug:
+                            print(f"litlm trying model: {m}")
+                        coro = acompletion(model=m, messages=r, caching=caching, num_retries=num_retries, max_tokens=max_tokens, timeout=timeout, **call_kwargs)
+                        res = await asyncio.wait_for(coro, timeout=timeout) if timeout else await coro
+                        try: res._litlm_model_used = m
+                        except Exception: pass
+                        _record_cost(res, m)
+                        if debug:
+                            print(f"litlm succeeded with model: {m}")
+                        return res
+                    except litellm.UnsupportedParamsError as e:
+                        # This is a local pre-flight error in litellm, no network request was made yet.
+                        if "reasoning_effort" in str(e) and _drop_reasoning_effort(call_kwargs):
+                            # Automatically ignore reasoning_effort if litellm says it's unsupported
+                            if debug:
+                                print(f"litlm Dropped reasoning_effort locally for {m} due to UnsupportedParamsError")
+                            continue
+
+                        if debug:
+                            print(f"litlm failed with model {m}: {type(e).__name__}: {e}")
+                        last = e
+                        break
+                    except TimeoutError:
+                        last = TimeoutError(f"litlm timed out after {timeout}s while calling {m}")
+                        if debug:
+                            print(f"litlm failed with model {m}: TimeoutError: {last}")
+                        break
+                    except Exception as e:
+                        if _mentions_unsupported_reasoning_effort(e) and _drop_reasoning_effort(call_kwargs):
+                            # Some providers reject extra_body.reasoning_effort at request time.
+                            if debug:
+                                print(f"litlm Dropped reasoning_effort for {m} after provider rejection")
+                            continue
+                        if debug:
+                            print(f"litlm failed with model {m}: {type(e).__name__}: {e}")
+                        last = e
+                        break
+            raise last from None
         tasks = [_one(r) for r in reqs]
         if show_progress and len(reqs) > 1: return await tq.gather(*tasks, desc="Completing")
         return await asyncio.gather(*tasks)
