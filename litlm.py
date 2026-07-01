@@ -250,7 +250,7 @@ class Text(str):
 
 def get_history(idx=-1): return _HISTORY[idx] if _HISTORY else None
 
-def complete(inputs, model="openrouter/openai/gpt-4.1-nano", system=None, json=False, show_progress=True, caching=False, prompt_cache=False, cache_control=None, num_retries=3, max_tokens=1024, timeout=60, debug=False, **kwargs):
+def complete(inputs, model="openrouter/openai/gpt-4.1-nano", system=None, json=False, show_progress=True, caching=False, prompt_cache=False, cache_control=None, num_retries=3, max_tokens=1024, timeout=60, debug=False, max_concurrency=None, **kwargs):
     debug = bool(debug or kwargs.pop("debug", False))
     validate_args(kwargs)
     if caching: _ensure_cache()
@@ -325,7 +325,13 @@ def complete(inputs, model="openrouter/openai/gpt-4.1-nano", system=None, json=F
                         last = e
                         break
             raise last from None
-        tasks = [_one(r) for r in reqs]
+        if max_concurrency and max_concurrency > 0:
+            _sem = asyncio.Semaphore(int(max_concurrency))
+            async def _bounded(r):
+                async with _sem: return await _one(r)
+            tasks = [_bounded(r) for r in reqs]
+        else:
+            tasks = [_one(r) for r in reqs]
         if show_progress and len(reqs) > 1: return await tq.gather(*tasks, desc="Completing")
         return await asyncio.gather(*tasks)
 
