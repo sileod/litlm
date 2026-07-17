@@ -7,3 +7,11 @@ dist/
 *.egg-info/
 .env
 scratch_tests/
+.antigravitycli/
+data-gym-cache/
+
+# Local provider experiments (may contain credentials or make paid API calls)
+test_nvidia.py
+test_openai.py
+test_reasoning*.py
+test_supported.py
