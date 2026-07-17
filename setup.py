@@ -8,7 +8,7 @@ setup(
     long_description_content_type="text/markdown",
     author="Damien Sileo",
     url="https://github.com/sileod/litlm",
-    py_modules=["litlm"],
+    py_modules=["litlm", "litlm_providers"],
     install_requires=[
         "litellm",
         "tqdm",          # Required for progress bars

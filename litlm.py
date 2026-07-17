@@ -4,15 +4,14 @@ import json as jsonlib
 import nest_asyncio; nest_asyncio.apply()
 import litellm
 from litellm import acompletion, Cache
-from tqdm.asyncio import tqdm as tq
-import requests
+from tqdm.auto import tqdm as tq
 import warnings
 import inspect
 from datetime import datetime, timedelta
-from functools import lru_cache
 from pathlib import Path
 import appdirs
-import os, logging
+import os, logging, sys
+from litlm_providers import _fallback_models, _litellm_model
 
 # suppression of annoying messages
 os.environ["PYDANTIC_ERRORS_OMIT_URL"] = "1"
@@ -28,18 +27,54 @@ def extract_answer(s, tag="answer"):
     return s.split(first_tag)[1].split(last_tag)[0].strip()
 
 
+def _first_json_span(s):
+    """Span of the first balanced {...} or [...] in s, respecting strings/escapes (so braces inside
+    string values don't fool the scan). Returns (start, end) or None."""
+    start = next((i for i, c in enumerate(s) if c in "{["), None)
+    if start is None:
+        return None
+    open_c = s[start]; close_c = "}" if open_c == "{" else "]"
+    depth = 0; in_str = False; esc = False
+    for i in range(start, len(s)):
+        c = s[i]
+        if in_str:
+            esc = (c == "\\" and not esc)
+            if c == '"' and not esc: in_str = False
+        elif c == '"': in_str = True
+        elif c == open_c: depth += 1
+        elif c == close_c:
+            depth -= 1
+            if depth == 0: return (start, i + 1)
+    return None
+
+
+def extract_json(s, default=None):
+    """Best-effort parse of JSON emitted by an LLM. Tolerates ```json fences and prose around the object
+    by falling back to the first balanced {...}/[...] span. Returns `default` if nothing parses (when
+    `default` is left None and parsing fails, raises ValueError)."""
+    s = str(s).strip()
+    if s.startswith("```"):                                   # strip a leading ```json / ``` fence
+        s = s.split("```", 2)[1] if s.count("```") >= 2 else s.strip("`")
+        if s.lstrip().lower().startswith("json"): s = s.lstrip()[4:]
+    for candidate in (s, (lambda sp: s[sp[0]:sp[1]] if sp else None)(_first_json_span(s))):
+        if candidate is None: continue
+        try:
+            return jsonlib.loads(candidate)
+        except Exception:
+            continue
+    if default is not None:
+        return default
+    raise ValueError(f"could not extract JSON from model reply: {s[:200]!r}")
+
+
 # --- Configuration & Cache ---
 CACHE_DIR = Path(appdirs.user_cache_dir("litlm"))
 _CACHE_READY = False
 
 _HISTORY = []
 _COSTS = []
+_FAILURES = []
 _MODEL_USED = {}
-_NVIDIA_PROVIDER_ALIASES = {
-    "deepseek": "deepseek-ai",
-}
-_NVIDIA_MODELS_TTL = timedelta(days=1)
-_NVIDIA_MODELS_CACHE = {}
 
 # --- Helpers ---
 def _ensure_cache():
@@ -61,81 +96,8 @@ def validate_args(kwargs):
         if k not in valid:
             warnings.warn(f"Argument '{k}' is not a standard parameter. Typo?", UserWarning)
 
-@lru_cache(maxsize=1)
-def _fetch_or_models():
-    try: return [m['id'] for m in requests.get("https://openrouter.ai/api/v1/models", timeout=2).json()['data']]
-    except: return []
-
-def _fetch_nvidia_models(api_base, api_key):
-    if not api_key: return []
-    now = datetime.now()
-    cache_key = (api_base, api_key)
-    cached = _NVIDIA_MODELS_CACHE.get(cache_key)
-    if cached and now - cached[0] < _NVIDIA_MODELS_TTL:
-        return cached[1]
-    try:
-        url = f"{api_base.rstrip('/')}/models"
-        r = requests.get(url, headers={"Authorization": f"Bearer {api_key}"}, timeout=2)
-        models = [m["id"] for m in r.json().get("data", [])]
-        _NVIDIA_MODELS_CACHE[cache_key] = (now, models)
-        return models
-    except Exception:
-        return cached[1] if cached else []
-
-def _strip_prefix(model):
-    for prefix in ("openrouter/", "nvidia_nim/"):
-        if model.startswith(prefix): return model[len(prefix):]
-    return model
-
-def _strip_free(model):
-    return model[:-5] if model.endswith(":free") else model
-
-def _resolve_or_model(model, free=False):
-    target = _strip_free(_strip_prefix(model))
-    models = _fetch_or_models()
-    pool = [m for m in models if m.endswith(":free") == free]
-    exact = f"{target}:free" if free else target
-    if exact in pool: return exact
-    cands = [m for m in pool if target in _strip_free(m)]
-    if cands: return sorted(cands, key=lambda m: ("latest" not in m, _strip_free(m) != target, len(m)))[0]
-    return exact
-
-def _known_or_model(model):
-    target = _strip_free(_strip_prefix(model))
-    return any(target in _strip_free(m) for m in _fetch_or_models())
-
-def _uniq(items):
-    out = []
-    for item in items:
-        if item not in out: out.append(item)
-    return out
-
-def _nvidia_slug(model):
-    if "/" not in model: return model
-    provider, rest = model.split("/", 1)
-    return f"{_NVIDIA_PROVIDER_ALIASES.get(provider, provider)}/{rest}"
-
-def _fallback_models(model):
-    if model.startswith("openrouter/"):
-        return [model]
-    if model.startswith("nvidia_nim/"):
-        return [f"nvidia_nim/{_nvidia_slug(_strip_prefix(model))}"]
-    if "/" in model:
-        return [f"openrouter/{model}"]
-    base = _strip_free(_strip_prefix(model))
-    if "/" not in model and _fetch_or_models() and not _known_or_model(model):
-        raise ValueError(f"Unknown model '{model}'. Use an exact provider/model name to bypass fuzzy matching.")
-    free_slug = _resolve_or_model(base, free=True)
-    paid_slug = _resolve_or_model(base)
-    free_or = f"openrouter/{free_slug}"
-    paid_or = f"openrouter/{paid_slug}"
-    nvidia_slug = _nvidia_slug(base if model.startswith("nvidia_nim/") else paid_slug)
-    nvidia_models = _fetch_nvidia_models(
-        os.environ.get("NVIDIA_NIM_API_BASE", "https://integrate.api.nvidia.com/v1"),
-        os.environ.get("NVIDIA_NIM_API_KEY"),
-    )
-    nvidia = [f"nvidia_nim/{nvidia_slug}"] if nvidia_slug in nvidia_models else []
-    return _uniq(nvidia + [free_or, paid_or])
+# Model-name resolution + provider fallback ordering live in litlm_providers.py
+# (albert -> nvidia_nim -> openrouter:free -> openrouter paid). Imported at top.
 
 def _normalize_reasoning(call_kwargs):
     reasoning = call_kwargs.pop("reasoning", None)
@@ -175,6 +137,22 @@ def _mentions_unsupported_reasoning_effort(exc):
         for token in ("unsupported", "not supported", "unrecognized", "unknown", "invalid", "extra inputs")
     ) or ("literal_error" in msg and "input should be" in msg)
 
+def _drop_response_format(call_kwargs):
+    """Drop response_format (json mode) so a provider that rejects it can still answer; extract_json then
+    recovers the JSON from the free-form reply."""
+    if "response_format" in call_kwargs:
+        call_kwargs.pop("response_format", None)
+        return True
+    return False
+
+
+def _mentions_unsupported_response_format(exc):
+    msg = str(exc).lower()
+    if "response_format" not in msg and "json_object" not in msg:
+        return False
+    return any(t in msg for t in ("unsupported", "not supported", "unrecognized", "unknown", "invalid", "extra inputs", "does not support"))
+
+
 def _with_provider_env(model, kwargs):
     call_kwargs = dict(kwargs)
     call_kwargs.pop("debug", None)
@@ -188,7 +166,13 @@ def _with_provider_env(model, kwargs):
         if "api_base" not in call_kwargs and "base_url" not in call_kwargs:
             call_kwargs["api_base"] = os.environ.get("OPENROUTER_API_BASE")
         call_kwargs = _normalize_reasoning(call_kwargs)
+    elif model.startswith("albert/"):
+        call_kwargs.setdefault("api_key", os.environ.get("ALBERT_API_KEY"))
+        if "api_base" not in call_kwargs and "base_url" not in call_kwargs:
+            call_kwargs["api_base"] = os.environ.get(
+                "ALBERT_API_BASE", "https://albert.api.etalab.gouv.fr/v1")
     return {k: v for k, v in call_kwargs.items() if v is not None}
+
 
 def _cache_control(prompt_cache, cache_control):
     if cache_control is not None: return cache_control
@@ -225,8 +209,11 @@ def _record_cost(response, model):
 
 def cost_breakdown(period="day", by="model"):
     now = datetime.now()
-    start = now - (timedelta(days=7) if period == "week" else timedelta(days=1))
-    rows = [r for r in _COSTS if r["time"] >= start]
+    if period == "session":
+        rows = list(_COSTS)
+    else:
+        start = now - (timedelta(days=7) if period == "week" else timedelta(days=1))
+        rows = [r for r in _COSTS if r["time"] >= start]
     out = {}
     for r in rows:
         key = r["model"] if by == "model" else r["time"].strftime("%Y-%m-%d")
@@ -244,13 +231,26 @@ class Text(str):
         psf = getattr(msg, "provider_specific_fields", None) or {}
         rc = getattr(msg, "reasoning_content", None) or psf.get("reasoning_content")
         obj.reasoning = obj.reasoning_content = rc
+        obj.failed = False
         return obj
     def __getattr__(self, name): return getattr(self._r, name)
     def __repr__(self): return super().__repr__()
 
+class Failure(str):
+    """Empty string-compatible result for one failed item in a batch."""
+    def __new__(cls, error, call_id, prompt, model):
+        obj = super().__new__(cls, "")
+        obj.error, obj.call_id, obj.prompt = error, call_id, prompt
+        obj.model_used, obj.cost, obj.failed = model, 0.0, True
+        return obj
+
 def get_history(idx=-1): return _HISTORY[idx] if _HISTORY else None
 
-def complete(inputs, model="openrouter/openai/gpt-4.1-nano", system=None, json=False, show_progress=True, caching=False, prompt_cache=False, cache_control=None, num_retries=3, max_tokens=1024, timeout=60, debug=False, max_concurrency=None, **kwargs):
+def get_failures(call_id=None):
+    """Failed batch items for this session, optionally restricted to one complete() call."""
+    return [f for f in _FAILURES if call_id is None or f.call_id == call_id]
+
+def complete(inputs, model="openrouter/openai/gpt-4.1-nano", system=None, json=False, show_progress=True, caching=False, prompt_cache=False, cache_control=None, num_retries=3, max_tokens=1024, timeout=60, debug=False, max_concurrency=None, rpm=None, **kwargs):
     debug = bool(debug or kwargs.pop("debug", False))
     validate_args(kwargs)
     if caching: _ensure_cache()
@@ -278,7 +278,18 @@ def complete(inputs, model="openrouter/openai/gpt-4.1-nano", system=None, json=F
         if debug:
             print(f"litlm fallback models: {models}")
         cc = _cache_control(prompt_cache, cache_control)
+        # rpm throttle: pace request STARTS to stay under `rpm` (parallel underneath, up to max_concurrency).
+        _interval = 60.0 / rpm if rpm else 0.0
+        _rl_lock = asyncio.Lock(); _next = [0.0]
+        async def _throttle():
+            if not _interval: return
+            async with _rl_lock:
+                loop = asyncio.get_event_loop(); now = loop.time()
+                wait = _next[0] - now
+                if wait > 0: await asyncio.sleep(wait)
+                _next[0] = max(now, _next[0]) + _interval
         async def _one(r):
+            await _throttle()
             last = None
             for m in models:
                 call_kwargs = _with_provider_env(m, kwargs)
@@ -289,8 +300,15 @@ def complete(inputs, model="openrouter/openai/gpt-4.1-nano", system=None, json=F
                     try:
                         if debug:
                             print(f"litlm trying model: {m}")
-                        coro = acompletion(model=m, messages=r, caching=caching, num_retries=num_retries, max_tokens=max_tokens, timeout=timeout, **call_kwargs)
-                        res = await asyncio.wait_for(coro, timeout=timeout) if timeout else await coro
+                        res = await acompletion(
+                            model=_litellm_model(m),
+                            messages=r,
+                            caching=caching,
+                            num_retries=num_retries,
+                            max_tokens=max_tokens,
+                            timeout=timeout,
+                            **call_kwargs,
+                        )
                         try: res._litlm_model_used = m
                         except Exception: pass
                         _record_cost(res, m)
@@ -303,6 +321,10 @@ def complete(inputs, model="openrouter/openai/gpt-4.1-nano", system=None, json=F
                             # Automatically ignore reasoning_effort if litellm says it's unsupported
                             if debug:
                                 print(f"litlm Dropped reasoning_effort locally for {m} due to UnsupportedParamsError")
+                            continue
+                        if "response_format" in str(e).lower() and _drop_response_format(call_kwargs):
+                            if debug:
+                                print(f"litlm Dropped response_format locally for {m}; will parse JSON from free text")
                             continue
 
                         if debug:
@@ -320,6 +342,11 @@ def complete(inputs, model="openrouter/openai/gpt-4.1-nano", system=None, json=F
                             if debug:
                                 print(f"litlm Dropped reasoning_effort for {m} after provider rejection")
                             continue
+                        if _mentions_unsupported_response_format(e) and _drop_response_format(call_kwargs):
+                            # Some providers reject response_format=json_object at request time.
+                            if debug:
+                                print(f"litlm Dropped response_format for {m} after provider rejection")
+                            continue
                         if debug:
                             print(f"litlm failed with model {m}: {type(e).__name__}: {e}")
                         last = e
@@ -332,14 +359,58 @@ def complete(inputs, model="openrouter/openai/gpt-4.1-nano", system=None, json=F
             tasks = [_bounded(r) for r in reqs]
         else:
             tasks = [_one(r) for r in reqs]
-        if show_progress and len(reqs) > 1: return await tq.gather(*tasks, desc="Completing")
+        if show_progress and len(reqs) > 1:
+            results = [None] * len(tasks)
+            batch_cost = 0.0
+            async def _settled(i, task):
+                try:
+                    return i, await task
+                except Exception as error:
+                    return i, error
+
+            pending = [_settled(i, task) for i, task in enumerate(tasks)]
+            bar = tq(asyncio.as_completed(pending), total=len(tasks), desc="Completing")
+            failed = 0
+            completed = 0
+            try:
+                for future in bar:
+                    i, response = await future
+                    results[i] = response
+                    completed += 1
+                    if isinstance(response, Exception):
+                        failed += 1
+                    else:
+                        batch_cost += float(_response_cost(response) or 0)
+                    status = f"cost=${batch_cost:.6f}"
+                    if failed:
+                        status += f", ⚠ {failed}/{completed} ({failed / completed:.1%})"
+                    bar.set_postfix_str(status)
+            finally:
+                bar.close()
+            return results
+        if len(reqs) > 1:
+            return await asyncio.gather(*tasks, return_exceptions=True)
         return await asyncio.gather(*tasks)
 
     # Execute
     raw = asyncio.get_event_loop().run_until_complete(_runner())
     call_id = len(_HISTORY)
-    out = [Text(r.choices[0].message.content or "", r, call_id, q) for r, q in zip(raw, reqs)]
-    res = [jsonlib.loads(str(x)) for x in out] if json else out
+    out = []
+    for r, q in zip(raw, reqs):
+        if isinstance(r, Exception):
+            failure = Failure(r, call_id, q, model)
+            _FAILURES.append(failure)
+            out.append(failure)
+        else:
+            out.append(Text(r.choices[0].message.content or "", r, call_id, q))
+    failed = sum(x.failed for x in out)
+    if failed:
+        print(
+            f"litlm: ⚠ {failed}/{len(out)} failed ({failed / len(out):.1%}); "
+            f"inspect with get_failures({call_id})",
+            file=sys.stderr,
+        )
+    res = [x if x.failed else extract_json(str(x)) for x in out] if json else out
     res = res if is_batch else res[0]
     _HISTORY.append(res)
     return res

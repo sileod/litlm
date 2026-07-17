@@ -27,7 +27,7 @@ print(res)
 # 2. Batch Processing (Parallel execution + Progress Bar)
 questions = ["Meaning of life?", "Capital of France?", "Who is TURING?"]
 answers = complete(questions)
-# > [Completing] 100%|██████████| 3/3 [00:01<00:00, 2.15it/s]
+# > [Completing] 100%|██████████| 3/3 [00:01<00:00, cost=$0.000123, ⚠ 1/3 (33.3%)]
 
 ```
 
@@ -77,7 +77,9 @@ complete("Summarize this", system="Be concise.")
 # JSON mode returns parsed JSON
 data = complete("Return {'topic': string} as JSON", json=True)
 
-# Lightweight in-memory spend summary for this Python session
+# Lightweight in-memory spend summaries
+session_costs = cost_breakdown("session")  # all calls since importing litlm
+print(f"Session cost: ${sum(session_costs.values()):.6f}")
 cost_breakdown("day")          # cost by model over the last day
 cost_breakdown("week", by="day")
 
@@ -115,8 +117,8 @@ res = complete("Question...", cache_control={"type": "ephemeral", "ttl": "1h"})
 # If you run this again, it returns instantly without API cost.
 res = complete("Complex query...", caching=True)
 
-# Built-in retries and timeout handling
-res = complete("Flaky API...", num_retries=5)
+# LiteLLM retries failed requests; timeout applies to each attempt.
+res = complete("Flaky API...", num_retries=5, timeout=60)
 
 ```
 
@@ -132,6 +134,16 @@ last_res = get_history()
 
 # Get a specific result by index
 first_res = get_history(0)
+
+# A failed batch item is an empty string-compatible result with metadata;
+# other items continue and the progress bar displays the failure rate.
+from litlm import get_failures
+failures = get_failures()       # all failures since import
+print(failures[-1].error)       # original LiteLLM/provider exception
+print(failures[-1].prompt)      # input that failed
+
+# Restrict inspection to the batch containing a particular result.
+batch_failures = get_failures(failures[-1].call_id)
 
 ```
 
