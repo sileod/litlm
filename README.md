@@ -1,163 +1,197 @@
 # litlm
 
-**litlm** is a minimalist, lazy-programmer wrapper around [LiteLLM](https://github.com/BerriAI/litellm). It removes the boilerplate from LLM API calls, handles async loops automatically (even in Jupyter), adds smart OpenRouter model resolution, and integrates natively with Pandas.
+`litlm` is a small, notebook-first interface to [LiteLLM](https://github.com/BerriAI/litellm). One function handles a prompt or a parallel batch, while keeping costs, provider metadata, failures, and retries close at hand.
 
-## Installation
+```python
+from litlm import complete
+
+answer = complete("What is 2 + 2?")
+
+answers = complete(
+    ["Summarize Ada Lovelace", "Summarize Alan Turing"],
+    model="gpt-4.1-mini",
+    max_concurrency=16,
+)
+```
+
+It is designed for exploratory work where the full SDK response is useful, but SDK ceremony is not.
+
+## Install
 
 ```bash
 pip install litlm
-
 ```
 
-## Quick Start
+Set the keys for the providers you use:
 
 ```python
 import os
-from litlm import complete, cost_breakdown
 
-os.environ["OPENROUTER_API_KEY"] = "sk-or-..." 
-os.environ["NVIDIA_NIM_API_KEY"] = "nvapi-..."  # Optional, used for the first NIM fallback
-os.environ["NVIDIA_NIM_API_BASE"] = "https://integrate.api.nvidia.com/v1/"  # Optional
-
-# 1. Simple String (Synchronous feel, but Async under the hood)
-res = complete("What is 2+2?")
-print(res) 
-# > "4"
-
-# 2. Batch Processing (Parallel execution + Progress Bar)
-questions = ["Meaning of life?", "Capital of France?", "Who is TURING?"]
-answers = complete(questions)
-# > [Completing] 100%|██████████| 3/3 [00:01<00:00, cost=$0.000123, ⚠ 1/3 (33.3%)]
-
+os.environ["OPENROUTER_API_KEY"] = "sk-or-..."
+os.environ["NVIDIA_NIM_API_KEY"] = "nvapi-..."      # optional
+os.environ["ALBERT_API_KEY"] = "..."                # optional
 ```
 
-## Key Features
+## Why litlm
 
-### 1. The "Text" Object
+- A string in, a string-like result out.
+- Lists, NumPy arrays, and Pandas Series run as ordered async batches.
+- Compact progress shows cost and a bounded error breakdown.
+- Partial batches stay usable and can retry only failed positions.
+- Results expose usage, reasoning, cost, model, and the raw LiteLLM response.
+- Bare model names can resolve through free and paid provider fallbacks.
+- The typed signature and docstring work well with Jupyter completion and Shift-Tab help.
 
-The result acts exactly like a string, but carries all metadata (usage, cost, raw response) and history.
+## Results that remain simple
+
+A scalar result behaves like `str`:
 
 ```python
-res = complete("Write a haiku")
+answer = complete("Write a haiku")
 
-print(res)              # It prints the content directly
-print(res.usage)        # Access token usage
-print(res.model_used)   # See which fallback route actually answered
-print(res.cost)         # LiteLLM/OpenRouter cost when available
-print(res.call_id)      # Unique ID for the call
-print(res.reasoning)    # Access reasoning content (e.g. for DeepSeek-R1 / o1)
-
+print(answer)
+print(answer.model_used)
+print(answer.cost)
+print(answer.usage)
+print(answer.reasoning)
+print(answer.call_id)
 ```
 
-### 2. Smart Provider Fallback
+Any other response field remains accessible through the same object.
 
-Stop typing provider prefixes. **litlm** tries the cheapest useful route first: NVIDIA NIM, then OpenRouter `:free`, then paid OpenRouter. It fuzzy-matches names against the OpenRouter list and automatically adds `:free` when needed.
+Batch results behave like an ordinary `list`, so existing Python and Pandas code continues to work:
 
 ```python
-# Automatically finds 'openrouter/openai/gpt-4o-mini'
-complete("Hello", model="gpt-4o-mini") 
+answers = complete(["Capital of France?", "Capital of Japan?"])
 
-# Automatically finds 'openrouter/anthropic/claude-3.5-sonnet'
-complete("Hello", model="sonnet")
-
-# Also works when you already know the provider/model slug
-complete("Hello", model="meta-llama/llama-3.3-70b-instruct")
-
-# Prefer "latest" variants when fuzzy matching, e.g. "haiku" -> haiku-latest
-complete("Hello", model="haiku")
-
+answers[0]
+len(answers)
+df["answer"] = answers
+isinstance(answers, list)  # True
 ```
 
-### 3. Small Conveniences
+## Resilient batches
 
-```python
-# System prompt shortcut
-complete("Summarize this", system="Be concise.")
+One failed request does not discard the rest of a batch. Failed positions are empty-string-compatible objects with the original exception and prompt attached, so output order and length remain stable.
 
-# JSON mode returns parsed JSON
-data = complete("Return {'topic': string} as JSON", json=True)
+During a batch, the progress line stays bounded while showing cost, failure rate, error types, and the beginning of a representative message:
 
-# Lightweight in-memory spend summaries
-session_costs = cost_breakdown("session")  # all calls since importing litlm
-print(f"Session cost: ${sum(session_costs.values()):.6f}")
-cost_breakdown("day")          # cost by model over the last day
-cost_breakdown("week", by="day")
-
+```text
+Completing: 95%|...| cost=$0.126242, ⚠ 375/755 (49.7%), Timeout×375 | Timeout Error: OpenRouter…
 ```
 
-### 4. Pandas & Numpy Support
-
-Pass DataFrames, Series, or Numpy arrays directly.
+Retry only the positions that failed, optionally with safer settings:
 
 ```python
-import pandas as pd
-
-df = pd.DataFrame({"prompts": ["Joke about cats", "Joke about dogs"]})
-
-# Returns a list of Text objects, keeping order
-df["results"] = complete(df["prompts"]) 
-
-```
-
-### 5. Prompt Caching & Robustness
-
-Use OpenRouter prompt caching for long repeated context, or opt into LiteLLM's local response cache during development.
-
-```python
-# OpenRouter prompt caching: top-level cache_control passthrough
-res = complete("Question over a long stable context...", prompt_cache=True)
-
-# 1-hour TTL for providers that support it
-res = complete("Question over a long stable context...", prompt_cache="1h")
-
-# Full passthrough when you want exact control
-res = complete("Question...", cache_control={"type": "ephemeral", "ttl": "1h"})
-
-# Old LiteLLM response cache remains available, but is off by default.
-# If you run this again, it returns instantly without API cost.
-res = complete("Complex query...", caching=True)
-
-# LiteLLM retries failed requests; timeout applies to each attempt.
-res = complete("Flaky API...", num_retries=5, timeout=60)
-
-```
-
-### 6. Session History
-
-Access your past generation without cluttering your variables.
-
-```python
-from litlm import get_history
-
-# Get the last result
-last_res = get_history()
-
-# Get a specific result by index
-first_res = get_history(0)
-
-# A failed batch item is an empty string-compatible result with metadata;
-# other items continue and the progress bar displays the failure rate.
-from litlm import get_failures
-failures = get_failures()       # all failures since import
-print(failures[-1].error)       # original LiteLLM/provider exception
-print(failures[-1].prompt)      # input that failed
-
-# Restrict inspection to the batch containing a particular result.
-batch_failures = get_failures(failures[-1].call_id)
-
-```
-
-## Advanced Configuration
-
-You can pass any standard `litellm` argument (temperature, max_tokens, etc.).
-
-```python
-complete(
-    "Hello", 
-    model="deepseek/deepseek-chat", 
-    temperature=0.7, 
-    max_tokens=500,
-    api_key="sk-..." # Optional if env var is set
+answers.resume(
+    timeout=180,
+    num_retries=5,
+    max_concurrency=8,
 )
 
+answers.failures  # failures still present after the retry
 ```
+
+`resume()` updates the same list-compatible result in place. Successful answers are neither requested again nor reordered.
+
+For the latest full provider exception:
+
+```python
+import litlm
+
+print(litlm.get_failure())
+```
+
+Or inspect every failed item and its metadata:
+
+```python
+failures = litlm.get_failures()
+print(failures[-1].error)
+print(failures[-1].prompt)
+```
+
+## Model routing
+
+Use a bare model name when you want `litlm` to find a suitable route:
+
+```python
+complete("Hello", model="gpt-4.1-mini")
+complete("Hello", model="deepseek-v4-flash")
+complete("Hello", model="haiku")
+```
+
+Depending on availability and configured keys, bare names are tried through Albert, NVIDIA NIM, OpenRouter free models, then paid OpenRouter models.
+
+Use an exact slug when routing should be explicit:
+
+```python
+complete("Hello", model="openrouter/anthropic/claude-sonnet-4")
+complete("Hello", model="nvidia_nim/deepseek-ai/deepseek-r1")
+```
+
+The returned `Text.model_used` records the route that answered.
+
+## Useful controls
+
+Common options are explicit and typed; additional LiteLLM parameters pass through unchanged:
+
+```python
+answer = complete(
+    "Explain the result briefly",
+    system="You are a careful mathematician.",
+    model="openrouter/deepseek/deepseek-v4-flash",
+    reasoning_effort="none",
+    temperature=0.2,
+    max_tokens=512,
+    timeout=60,
+)
+```
+
+Request and parse JSON directly:
+
+```python
+data = complete(
+    "Return a JSON object with a string field named topic",
+    json=True,
+)
+```
+
+Throttle large batches by concurrency or request starts per minute:
+
+```python
+answers = complete(inputs, max_concurrency=12, rpm=120)
+```
+
+## Caching
+
+Local response caching avoids paying twice for identical calls and survives notebook restarts:
+
+```python
+answer = complete("Expensive stable query", caching=True)
+```
+
+Provider-side prompt caching is separate:
+
+```python
+complete("Question over stable context", prompt_cache=True)
+complete("Question over stable context", prompt_cache="1h")
+complete(
+    "Question over stable context",
+    cache_control={"type": "ephemeral", "ttl": "1h"},
+)
+```
+
+## History and cost
+
+```python
+from litlm import cost_breakdown, get_history
+
+last_result = get_history()
+first_result = get_history(0)
+
+cost_breakdown("session")
+cost_breakdown("day")
+cost_breakdown("week", by="day")
+```
+
+Cost history is lightweight and in memory for the current Python process.
