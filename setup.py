@@ -2,8 +2,8 @@ from setuptools import setup
 
 setup(
     name="litlm",
-    version="0.3.0",
-    description="Minimalist litellm wrapper for simpler requests and better openrouter support",
+    version="0.4.0",
+    description="Notebook-first LiteLLM wrapper with parallel, resumable batches",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
     author="Damien Sileo",

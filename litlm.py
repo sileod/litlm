@@ -9,6 +9,7 @@ import warnings
 import inspect
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
 import appdirs
 import os, logging, sys
 from litlm_providers import _fallback_models, _litellm_model
@@ -244,14 +245,149 @@ class Failure(str):
         obj.model_used, obj.cost, obj.failed = model, 0.0, True
         return obj
 
-def get_history(idx=-1): return _HISTORY[idx] if _HISTORY else None
+class BatchResult(list):
+    """List-compatible batch output that can retry only its currently failed items."""
+    def __init__(self, values=(), resume_options=None):
+        super().__init__(values)
+        self._resume_options = dict(resume_options or {})
 
-def get_failures(call_id=None):
+    @property
+    def failures(self):
+        """Failures still present in this batch (resolved failures are excluded)."""
+        return [item for item in self if getattr(item, "failed", False)]
+
+    def resume(
+        self,
+        timeout: Optional[float] = None,
+        num_retries: Optional[int] = None,
+        max_concurrency: Optional[int] = None,
+        **overrides: Any,
+    ) -> "BatchResult":
+        """Retry failed positions in place, optionally overriding completion settings."""
+        if "inputs" in overrides:
+            raise TypeError("resume() determines inputs from failed batch items")
+
+        failed_indexes = [
+            index for index, item in enumerate(self)
+            if getattr(item, "failed", False)
+        ]
+        if not failed_indexes:
+            return self
+
+        options = dict(self._resume_options)
+        if timeout is not None:
+            options["timeout"] = timeout
+        if num_retries is not None:
+            options["num_retries"] = num_retries
+        if max_concurrency is not None:
+            options["max_concurrency"] = max_concurrency
+        options.update(overrides)
+
+        prompts = [self[index].prompt for index in failed_indexes]
+        retried = complete(inputs=prompts, **options)
+        for index, result in zip(failed_indexes, retried):
+            self[index] = result
+        self._resume_options = options
+        return self
+
+def get_history(idx: int = -1): return _HISTORY[idx] if _HISTORY else None
+
+def get_failures(call_id: Optional[int] = None) -> List[Failure]:
     """Failed batch items for this session, optionally restricted to one complete() call."""
     return [f for f in _FAILURES if call_id is None or f.call_id == call_id]
 
-def complete(inputs, model="openrouter/openai/gpt-4.1-nano", system=None, json=False, show_progress=True, caching=False, prompt_cache=False, cache_control=None, num_retries=3, max_tokens=1024, timeout=60, debug=False, max_concurrency=None, rpm=None, **kwargs):
+def get_failure(call_id: Optional[int] = None) -> Optional[Exception]:
+    """Most recent underlying exception, optionally restricted to one complete() call."""
+    failures = get_failures(call_id)
+    return failures[-1].error if failures else None
+
+def _error_groups(errors):
+    """Exception counts and first messages, ordered by count then first occurrence."""
+    by_type = {}
+    for error in errors:
+        name = type(error).__name__
+        if name in by_type:
+            by_type[name][0] += 1
+        else:
+            message = " ".join(str(error).split()) or "(no error message)"
+            by_type[name] = [1, message, len(by_type)]
+    return sorted(by_type.items(), key=lambda item: (-item[1][0], item[1][2]))
+
+def _crop(text, max_chars):
+    return text if len(text) <= max_chars else text[:max_chars - 1].rstrip() + "…"
+
+def _compact_error_breakdown(errors, max_types=2, max_chars=80):
+    """Bounded, single-line error breakdown suitable for a tqdm postfix."""
+    groups = _error_groups(errors)
+    shown = groups[:max_types]
+    counts = ", ".join(f"{name}×{count}" for name, (count, _, _) in shown)
+    if len(groups) > max_types:
+        counts += f", +{len(groups) - max_types} types"
+    message = shown[0][1][1] if shown else ""
+    detail = f"{counts} | {message}" if message else counts
+    return _crop(detail, max_chars)
+
+def _representative_failure_lines(failures, max_types=3, max_chars=240):
+    """One cropped example per exception type, including how often that type occurred."""
+    groups = _error_groups(failure.error for failure in failures)
+    lines = []
+    for name, (count, message, _) in groups[:max_types]:
+        prefix = f"{count}× " if count > 1 else ""
+        lines.append("  " + _crop(f"{prefix}{name}: {message}", max_chars))
+    remaining = len(groups) - len(lines)
+    if remaining:
+        lines.append(f"  … and {remaining} other error type{'s' if remaining != 1 else ''}")
+    return lines
+
+def complete(
+    inputs: Any,
+    model: str = "openrouter/openai/gpt-4.1-nano",
+    system: Optional[str] = None,
+    json: bool = False,
+    show_progress: bool = True,
+    caching: bool = False,
+    prompt_cache: Union[bool, str, Dict[str, Any]] = False,
+    cache_control: Optional[Dict[str, Any]] = None,
+    num_retries: int = 3,
+    max_tokens: int = 1024,
+    timeout: Optional[float] = 60,
+    debug: bool = False,
+    max_concurrency: Optional[int] = None,
+    rpm: Optional[float] = None,
+    reasoning_effort: Optional[str] = None,
+    temperature: Optional[float] = None,
+    **kwargs: Any,
+) -> Union[Text, Failure, BatchResult, Dict[str, Any], List[Any]]:
+    """Complete one prompt or an ordered batch with a synchronous, notebook-friendly API.
+
+    Args:
+        inputs: A string, message dict, conversation, or batch of those values.
+        model: Provider/model name or a bare model name resolved through configured fallbacks.
+        system: Optional system message prepended to each prompt.
+        json: Request JSON output and parse it before returning.
+        show_progress: Display a compact tqdm progress bar for batches.
+        caching: Cache complete responses locally so identical calls can be reused.
+        prompt_cache: Enable provider prompt caching; ``"1h"`` requests a one-hour TTL.
+        cache_control: Explicit provider cache-control object.
+        num_retries: Retries performed by LiteLLM for each provider request.
+        max_tokens: Maximum generated tokens per request.
+        timeout: Timeout in seconds for each provider attempt.
+        debug: Print provider routing and fallback details.
+        max_concurrency: Maximum simultaneous batch requests; ``None`` is unbounded.
+        rpm: Maximum request starts per minute; ``None`` disables throttling.
+        reasoning_effort: Reasoning level such as ``"none"``, ``"low"``, or ``"high"``.
+        temperature: Sampling temperature forwarded to the provider.
+        **kwargs: Additional LiteLLM/provider parameters.
+
+    Returns:
+        A Text-like scalar for one prompt, or a list-compatible BatchResult. Call
+        ``batch.resume(timeout=...)`` to retry only failed batch positions in place.
+    """
     debug = bool(debug or kwargs.pop("debug", False))
+    if reasoning_effort is not None:
+        kwargs["reasoning_effort"] = reasoning_effort
+    if temperature is not None:
+        kwargs["temperature"] = temperature
     validate_args(kwargs)
     if caching: _ensure_cache()
     if json and "response_format" not in kwargs: kwargs["response_format"] = {"type": "json_object"}
@@ -372,6 +508,7 @@ def complete(inputs, model="openrouter/openai/gpt-4.1-nano", system=None, json=F
             bar = tq(asyncio.as_completed(pending), total=len(tasks), desc="Completing")
             failed = 0
             completed = 0
+            errors = []
             try:
                 for future in bar:
                     i, response = await future
@@ -379,11 +516,15 @@ def complete(inputs, model="openrouter/openai/gpt-4.1-nano", system=None, json=F
                     completed += 1
                     if isinstance(response, Exception):
                         failed += 1
+                        errors.append(response)
                     else:
                         batch_cost += float(_response_cost(response) or 0)
                     status = f"cost=${batch_cost:.6f}"
                     if failed:
-                        status += f", ⚠ {failed}/{completed} ({failed / completed:.1%})"
+                        status += (
+                            f", ⚠ {failed}/{completed} ({failed / completed:.1%}), "
+                            f"{_compact_error_breakdown(errors)}"
+                        )
                     bar.set_postfix_str(status)
             finally:
                 bar.close()
@@ -405,13 +546,36 @@ def complete(inputs, model="openrouter/openai/gpt-4.1-nano", system=None, json=F
             out.append(Text(r.choices[0].message.content or "", r, call_id, q))
     failed = sum(x.failed for x in out)
     if failed:
-        print(
-            f"litlm: ⚠ {failed}/{len(out)} failed ({failed / len(out):.1%}); "
-            f"inspect with get_failures({call_id})",
-            file=sys.stderr,
-        )
+        call_failures = [x for x in out if x.failed]
+        summary = [
+            f"litlm: ⚠ {failed}/{len(out)} failed ({failed / len(out):.1%})",
+            "litlm: representative error(s):",
+            *_representative_failure_lines(call_failures),
+            f"litlm: inspect the full error with litlm.get_failure({call_id})",
+        ]
+        print("\n".join(summary), file=sys.stderr)
     res = [x if x.failed else extract_json(str(x)) for x in out] if json else out
-    res = res if is_batch else res[0]
+    if is_batch:
+        resume_options = {
+            "model": model,
+            "json": json,
+            "show_progress": show_progress,
+            "caching": caching,
+            "prompt_cache": prompt_cache,
+            "cache_control": cache_control,
+            "num_retries": num_retries,
+            "max_tokens": max_tokens,
+            "timeout": timeout,
+            "debug": debug,
+            "max_concurrency": max_concurrency,
+            "rpm": rpm,
+            "reasoning_effort": reasoning_effort,
+            "temperature": temperature,
+            **kwargs,
+        }
+        res = BatchResult(res, resume_options=resume_options)
+    else:
+        res = res[0]
     _HISTORY.append(res)
     return res
 
