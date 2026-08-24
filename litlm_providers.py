@@ -2,8 +2,9 @@
 
 A bare model name (e.g. "gpt-oss-120b") is resolved into an ordered fallback list, cheapest first:
     albert (free)  ->  nvidia_nim (free)  ->  openrouter :free  ->  openrouter (paid)
-A provider-prefixed name ("openrouter/…", "nvidia_nim/…", "albert/…", "vendor/model") is passed through
-as-is (no fuzzy fallback). Albert (albert.api.etalab.gouv.fr) is an OpenAI-compatible endpoint, so it is
+A provider-prefixed name ("openrouter/…", "nvidia_nim/…", "albert/…") is passed through
+as-is (no fuzzy fallback). ``direct/<litellm-provider>/<model>`` bypasses litlm routing and is passed
+directly to LiteLLM. Albert (albert.api.etalab.gouv.fr) is an OpenAI-compatible endpoint, so it is
 reached through litellm's openai/ handler + api_base (see _litellm_model).
 """
 import os
@@ -128,12 +129,18 @@ def _known_or_model(model):
 
 # --- routing ---
 def _litellm_model(m):
+    if m.startswith("direct/"):
+        return m[len("direct/"):]
     # albert/<id> is an OpenAI-compatible endpoint; litellm reaches it via its openai/ handler + api_base.
     return f"openai/{m[len('albert/'):]}" if m.startswith("albert/") else m
 
 
 def _fallback_models(model):
     """Ordered fallback list for `model`, cheapest first: albert -> nvidia_nim -> or:free -> or(paid)."""
+    if model.startswith("direct/"):
+        if model.count("/") < 2:
+            raise ValueError("direct routes require direct/<litellm-provider>/<model>")
+        return [model]
     if model.startswith("openrouter/"):
         return [model]
     if model.startswith("nvidia_nim/"):

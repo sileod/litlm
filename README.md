@@ -129,6 +129,14 @@ complete("Hello", model="openrouter/anthropic/claude-sonnet-4")
 complete("Hello", model="nvidia_nim/deepseek-ai/deepseek-r1")
 ```
 
+To bypass litlm routing and call a LiteLLM provider directly, prefix the exact
+LiteLLM route with `direct/`:
+
+```python
+complete("Hello", model="direct/gemini/gemini-3.7-flash")
+complete("Hello", model="direct/openai/gpt-5.6-luna")
+```
+
 The returned `Text.model_used` records the route that answered.
 
 ## Useful controls
