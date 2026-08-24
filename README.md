@@ -162,6 +162,20 @@ Throttle large batches by concurrency or request starts per minute:
 answers = complete(inputs, max_concurrency=12, rpm=120)
 ```
 
+Persist or stream results as soon as each item settles without coupling
+`litlm` to an application's storage format:
+
+```python
+def save_result(index, result):
+    if not result.failed:
+        checkpoint(index, str(result), result.usage)
+
+answers = complete(inputs, max_concurrency=12, on_result=save_result)
+```
+
+The callback receives the original input index and a `Text` or `Failure`.
+`BatchResult.resume()` preserves original indexes when it retries failed items.
+
 ## Caching
 
 Local response caching avoids paying twice for identical calls and survives notebook restarts:

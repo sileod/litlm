@@ -9,7 +9,7 @@ import warnings
 import inspect
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 import appdirs
 import os, logging, sys
 from litlm_providers import _fallback_models, _litellm_model
@@ -284,7 +284,15 @@ class BatchResult(list):
         options.update(overrides)
 
         prompts = [self[index].prompt for index in failed_indexes]
-        retried = complete(inputs=prompts, **options)
+        call_options = dict(options)
+        on_result = call_options.get("on_result")
+        if on_result is not None:
+            call_options["on_result"] = (
+                lambda retry_index, result: on_result(
+                    failed_indexes[retry_index], result
+                )
+            )
+        retried = complete(inputs=prompts, **call_options)
         for index, result in zip(failed_indexes, retried):
             self[index] = result
         self._resume_options = options
@@ -356,6 +364,7 @@ def complete(
     rpm: Optional[float] = None,
     reasoning_effort: Optional[str] = None,
     temperature: Optional[float] = None,
+    on_result: Optional[Callable[[int, Union[Text, Failure]], None]] = None,
     **kwargs: Any,
 ) -> Union[Text, Failure, BatchResult, Dict[str, Any], List[Any]]:
     """Complete one prompt or an ordered batch with a synchronous, notebook-friendly API.
@@ -377,6 +386,9 @@ def complete(
         rpm: Maximum request starts per minute; ``None`` disables throttling.
         reasoning_effort: Reasoning level such as ``"none"``, ``"low"``, or ``"high"``.
         temperature: Sampling temperature forwarded to the provider.
+        on_result: Optional callback invoked as each batch item settles. It
+            receives the item's original input index and its ``Text`` or
+            ``Failure`` result. Callback exceptions abort ``complete``.
         **kwargs: Additional LiteLLM/provider parameters.
 
     Returns:
@@ -407,6 +419,25 @@ def complete(
             reqs = [_messages(i) for i in inputs]
     else: raise ValueError("Input must be string, list, dict, or pandas object.")
     reqs = [_messages(r, system) for r in reqs]
+
+    call_id = len(_HISTORY)
+
+    def _wrap_result(index, response):
+        if isinstance(response, (Text, Failure)):
+            result = response
+        elif isinstance(response, Exception):
+            result = Failure(response, call_id, reqs[index], model)
+            _FAILURES.append(result)
+        else:
+            result = Text(
+                response.choices[0].message.content or "",
+                response,
+                call_id,
+                reqs[index],
+            )
+        if on_result is not None:
+            on_result(index, result)
+        return result
 
     # Async Runner
     async def _runner():
@@ -495,7 +526,7 @@ def complete(
             tasks = [_bounded(r) for r in reqs]
         else:
             tasks = [_one(r) for r in reqs]
-        if show_progress and len(reqs) > 1:
+        if (show_progress or on_result is not None) and len(reqs) > 1:
             results = [None] * len(tasks)
             batch_cost = 0.0
             async def _settled(i, task):
@@ -505,29 +536,33 @@ def complete(
                     return i, error
 
             pending = [_settled(i, task) for i, task in enumerate(tasks)]
-            bar = tq(asyncio.as_completed(pending), total=len(tasks), desc="Completing")
+            settled = asyncio.as_completed(pending)
+            bar = tq(settled, total=len(tasks), desc="Completing") if show_progress else settled
             failed = 0
             completed = 0
             errors = []
             try:
                 for future in bar:
                     i, response = await future
-                    results[i] = response
+                    result = _wrap_result(i, response)
+                    results[i] = result
                     completed += 1
-                    if isinstance(response, Exception):
+                    if result.failed:
                         failed += 1
-                        errors.append(response)
+                        errors.append(result.error)
                     else:
-                        batch_cost += float(_response_cost(response) or 0)
+                        batch_cost += float(result.cost or 0)
                     status = f"cost=${batch_cost:.6f}"
                     if failed:
                         status += (
                             f", ⚠ {failed}/{completed} ({failed / completed:.1%}), "
                             f"{_compact_error_breakdown(errors)}"
                         )
-                    bar.set_postfix_str(status)
+                    if show_progress:
+                        bar.set_postfix_str(status)
             finally:
-                bar.close()
+                if show_progress:
+                    bar.close()
             return results
         if len(reqs) > 1:
             return await asyncio.gather(*tasks, return_exceptions=True)
@@ -535,15 +570,10 @@ def complete(
 
     # Execute
     raw = asyncio.get_event_loop().run_until_complete(_runner())
-    call_id = len(_HISTORY)
-    out = []
-    for r, q in zip(raw, reqs):
-        if isinstance(r, Exception):
-            failure = Failure(r, call_id, q, model)
-            _FAILURES.append(failure)
-            out.append(failure)
-        else:
-            out.append(Text(r.choices[0].message.content or "", r, call_id, q))
+    out = [
+        r if isinstance(r, (Text, Failure)) else _wrap_result(index, r)
+        for index, r in enumerate(raw)
+    ]
     failed = sum(x.failed for x in out)
     if failed:
         call_failures = [x for x in out if x.failed]
@@ -571,6 +601,7 @@ def complete(
             "rpm": rpm,
             "reasoning_effort": reasoning_effort,
             "temperature": temperature,
+            "on_result": on_result,
             **kwargs,
         }
         res = BatchResult(res, resume_options=resume_options)

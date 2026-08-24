@@ -158,8 +158,66 @@ class RetryTimeoutTests(unittest.TestCase):
 
         self.assertIn("reasoning_effort", signature.parameters)
         self.assertIn("temperature", signature.parameters)
+        self.assertIn("on_result", signature.parameters)
         self.assertIsNot(signature.parameters["timeout"].annotation, inspect.Parameter.empty)
         self.assertIsNot(signature.return_annotation, inspect.Signature.empty)
+
+    def test_on_result_streams_settled_results_with_original_indexes(self):
+        release_second = asyncio.Event()
+        events = []
+
+        async def fake_acompletion(**kwargs):
+            content = kwargs["messages"][0]["content"]
+            if content == "first":
+                await release_second.wait()
+            else:
+                release_second.set()
+            if content == "bad":
+                raise RuntimeError("broken")
+            return _response(content)
+
+        with patch.object(litlm, "acompletion", fake_acompletion), redirect_stderr(io.StringIO()):
+            result = litlm.complete(
+                ["first", "second", "bad"],
+                model="openrouter/test-model",
+                show_progress=False,
+                num_retries=0,
+                on_result=lambda index, item: events.append(
+                    (index, str(item), item.failed)
+                ),
+            )
+
+        self.assertEqual([str(item) for item in result], ["first", "second", ""])
+        self.assertEqual({event[0] for event in events}, {0, 1, 2})
+        self.assertEqual(len(events), 3)
+        self.assertLess(
+            next(i for i, event in enumerate(events) if event[0] == 1),
+            next(i for i, event in enumerate(events) if event[0] == 0),
+        )
+        self.assertEqual(next(event for event in events if event[0] == 2), (2, "", True))
+
+    def test_resume_callback_uses_original_batch_index(self):
+        callback_indexes = []
+
+        async def fake_acompletion(**kwargs):
+            content = kwargs["messages"][0]["content"]
+            if content == "bad" and kwargs["timeout"] < 10:
+                raise TimeoutError("retry me")
+            return _response(content)
+
+        with patch.object(litlm, "acompletion", fake_acompletion), redirect_stderr(io.StringIO()):
+            result = litlm.complete(
+                ["good", "bad"],
+                model="openrouter/test-model",
+                timeout=1,
+                show_progress=False,
+                num_retries=0,
+                on_result=lambda index, _item: callback_indexes.append(index),
+            )
+            callback_indexes.clear()
+            result.resume(timeout=10)
+
+        self.assertEqual(callback_indexes, [1])
 
     def test_session_cost_includes_rows_older_than_one_day(self):
         litlm._COSTS.extend([
