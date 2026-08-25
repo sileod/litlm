@@ -2,7 +2,7 @@ from setuptools import setup
 
 setup(
     name="litlm",
-    version="0.5.1",
+    version="0.5.2",
     description="Notebook-first LiteLLM wrapper with parallel, resumable batches",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",

@@ -9,7 +9,7 @@ import warnings
 import inspect
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Union
 import appdirs
 import os, logging, sys
 from litlm_providers import _fallback_models, _litellm_model
@@ -152,6 +152,24 @@ def _mentions_unsupported_response_format(exc):
     if "response_format" not in msg and "json_object" not in msg:
         return False
     return any(t in msg for t in ("unsupported", "not supported", "unrecognized", "unknown", "invalid", "extra inputs", "does not support"))
+
+
+def _quota_exhausted(exc):
+    """Whether a provider failure makes retrying the same route wasteful for this batch."""
+    msg = str(exc).lower().replace("_", " ")
+    return any(
+        token in msg
+        for token in (
+            "quota exceeded",
+            "resource exhausted",
+            "key limit exceeded",
+            "insufficient quota",
+            "out of credits",
+            "credit balance",
+            "spending limit",
+            "payment required",
+        )
+    )
 
 
 def _with_provider_env(model, kwargs):
@@ -359,12 +377,14 @@ def complete(
     num_retries: int = 3,
     max_tokens: int = 1024,
     timeout: Optional[float] = 60,
+    attempt_timeout: Optional[float] = None,
     debug: bool = False,
     max_concurrency: Optional[int] = None,
     rpm: Optional[float] = None,
     reasoning_effort: Optional[str] = None,
     temperature: Optional[float] = None,
     on_result: Optional[Callable[[int, Union[Text, Failure]], None]] = None,
+    fallbacks: Optional[Sequence[str]] = None,
     **kwargs: Any,
 ) -> Union[Text, Failure, BatchResult, Dict[str, Any], List[Any]]:
     """Complete one prompt or an ordered batch with a synchronous, notebook-friendly API.
@@ -381,6 +401,9 @@ def complete(
         num_retries: Retries performed by LiteLLM for each provider request.
         max_tokens: Maximum generated tokens per request.
         timeout: Timeout in seconds for each provider attempt.
+        attempt_timeout: Optional hard wall-clock bound around an entire
+            provider attempt. Unlike `timeout`, this also covers providers
+            that fail to honor LiteLLM's request timeout.
         debug: Print provider routing and fallback details.
         max_concurrency: Maximum simultaneous batch requests; ``None`` is unbounded.
         rpm: Maximum request starts per minute; ``None`` disables throttling.
@@ -389,6 +412,8 @@ def complete(
         on_result: Optional callback invoked as each batch item settles. It
             receives the item's original input index and its ``Text`` or
             ``Failure`` result. Callback exceptions abort ``complete``.
+        fallbacks: Optional exact, ordered route list. When omitted, a bare
+            model uses litlm's free/BYOK-first provider hierarchy.
         **kwargs: Additional LiteLLM/provider parameters.
 
     Returns:
@@ -441,9 +466,18 @@ def complete(
 
     # Async Runner
     async def _runner():
-        models = _fallback_models(model)
+        if fallbacks is None:
+            models = _fallback_models(model)
+        else:
+            if isinstance(fallbacks, str) or not fallbacks:
+                raise ValueError("fallbacks must be a non-empty sequence of exact routes")
+            models = []
+            for route in fallbacks:
+                models.extend(_fallback_models(route))
+            models = list(dict.fromkeys(models))
         if debug:
             print(f"litlm fallback models: {models}")
+        disabled_routes = set()
         cc = _cache_control(prompt_cache, cache_control)
         # rpm throttle: pace request STARTS to stay under `rpm` (parallel underneath, up to max_concurrency).
         _interval = 60.0 / rpm if rpm else 0.0
@@ -459,6 +493,10 @@ def complete(
             await _throttle()
             last = None
             for m in models:
+                if m in disabled_routes:
+                    if debug:
+                        print(f"litlm skipping batch-disabled route: {m}")
+                    continue
                 call_kwargs = _with_provider_env(m, kwargs)
                 if cc and m.startswith("openrouter/"): call_kwargs["cache_control"] = cc
 
@@ -467,14 +505,14 @@ def complete(
                     try:
                         if debug:
                             print(f"litlm trying model: {m}")
-                        res = await acompletion(
-                            model=_litellm_model(m),
-                            messages=r,
-                            caching=caching,
-                            num_retries=num_retries,
-                            max_tokens=max_tokens,
-                            timeout=timeout,
-                            **call_kwargs,
+                        request = acompletion(
+                            model=_litellm_model(m), messages=r, caching=caching,
+                            num_retries=num_retries, max_tokens=max_tokens,
+                            timeout=timeout, **call_kwargs,
+                        )
+                        res = (
+                            await asyncio.wait_for(request, timeout=attempt_timeout)
+                            if attempt_timeout else await request
                         )
                         try: res._litlm_model_used = m
                         except Exception: pass
@@ -516,8 +554,14 @@ def complete(
                             continue
                         if debug:
                             print(f"litlm failed with model {m}: {type(e).__name__}: {e}")
+                        if _quota_exhausted(e):
+                            disabled_routes.add(m)
+                            if debug:
+                                print(f"litlm disabling exhausted route for this batch: {m}")
                         last = e
                         break
+            if last is None:
+                last = RuntimeError("all configured fallback routes are disabled")
             raise last from None
         if max_concurrency and max_concurrency > 0:
             _sem = asyncio.Semaphore(int(max_concurrency))
@@ -596,12 +640,14 @@ def complete(
             "num_retries": num_retries,
             "max_tokens": max_tokens,
             "timeout": timeout,
+            "attempt_timeout": attempt_timeout,
             "debug": debug,
             "max_concurrency": max_concurrency,
             "rpm": rpm,
             "reasoning_effort": reasoning_effort,
             "temperature": temperature,
             "on_result": on_result,
+            "fallbacks": fallbacks,
             **kwargs,
         }
         res = BatchResult(res, resume_options=resume_options)

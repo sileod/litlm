@@ -1,7 +1,7 @@
 """Model-name resolution and provider fallback ordering for litlm.
 
 A bare model name (e.g. "gpt-oss-120b") is resolved into an ordered fallback list, cheapest first:
-    albert (free)  ->  nvidia_nim (free)  ->  openrouter :free  ->  openrouter (paid)
+    albert (free)  ->  nvidia_nim (free)  ->  Gemini BYOK  ->  openrouter :free  ->  openrouter (paid)
 A provider-prefixed name ("openrouter/…", "nvidia_nim/…", "albert/…") is passed through
 as-is (no fuzzy fallback). ``direct/<litellm-provider>/<model>`` bypasses litlm routing and is passed
 directly to LiteLLM. Albert (albert.api.etalab.gouv.fr) is an OpenAI-compatible endpoint, so it is
@@ -127,6 +127,16 @@ def _known_or_model(model):
     return any(target in _strip_free(m) for m in _fetch_or_models())
 
 
+def _gemini_route(base, openrouter_slug):
+    """Direct LiteLLM Gemini route when the resolved model is a Google Gemini model."""
+    target = openrouter_slug if openrouter_slug.startswith("google/") else base
+    if target.startswith("google/"):
+        target = target.split("/", 1)[1]
+    if target.startswith("gemini-") and os.environ.get("GEMINI_API_KEY"):
+        return f"direct/gemini/{target}"
+    return None
+
+
 # --- routing ---
 def _litellm_model(m):
     if m.startswith("direct/"):
@@ -136,7 +146,7 @@ def _litellm_model(m):
 
 
 def _fallback_models(model):
-    """Ordered fallback list for `model`, cheapest first: albert -> nvidia_nim -> or:free -> or(paid)."""
+    """Resolve a bare model through free/BYOK routes before OpenRouter."""
     if model.startswith("direct/"):
         if model.count("/") < 2:
             raise ValueError("direct routes require direct/<litellm-provider>/<model>")
@@ -161,7 +171,7 @@ def _fallback_models(model):
     if not albert and _fetch_or_models() and not _known_or_model(model):
         raise ValueError(f"Unknown model '{model}'. Use an exact provider/model name to bypass fuzzy matching.")
 
-    # 3/4) openrouter free then paid
+    # OpenRouter resolution also gives provider-qualified names used by NIM/Gemini.
     free_or = f"openrouter/{_resolve_or_model(base, free=True)}"
     paid_slug = _resolve_or_model(base)
     paid_or = f"openrouter/{paid_slug}"
@@ -173,4 +183,8 @@ def _fallback_models(model):
         os.environ.get("NVIDIA_NIM_API_KEY"))
     nvidia = [f"nvidia_nim/{nvidia_slug}"] if nvidia_slug in nvidia_models else []
 
-    return _uniq(albert + nvidia + [free_or, paid_or])
+    # 3) direct Gemini BYOK, before any OpenRouter route.
+    gemini_route = _gemini_route(base, paid_slug)
+    gemini = [gemini_route] if gemini_route else []
+
+    return _uniq(albert + nvidia + gemini + [free_or, paid_or])

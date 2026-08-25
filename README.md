@@ -139,6 +139,28 @@ complete("Hello", model="direct/openai/gpt-5.6-luna")
 
 The returned `Text.model_used` records the route that answered.
 
+Bare model names use a free/BYOK-first fallback hierarchy: Albert, NVIDIA NIM,
+direct Gemini when `GEMINI_API_KEY` is available, OpenRouter free, then paid
+OpenRouter. Provider/model names remain exact and do not fall back. For a fully
+explicit hierarchy, pass exact routes in order:
+
+```python
+complete(
+    "Hello",
+    model="gemini-3.7-flash",
+    fallbacks=[
+        "direct/gemini/gemini-3.7-flash",
+        "openrouter/google/gemini-3.7-flash",
+    ],
+)
+```
+
+Fallback is per item. If a route reports exhausted quota or credits, litlm
+disables it for the rest of that batch so later items proceed directly to the
+next route. Already in-flight requests may still settle. Set `attempt_timeout`
+for a hard wall-clock bound around providers that fail to honor their own
+request timeout.
+
 ## Useful controls
 
 Common options are explicit and typed; additional LiteLLM parameters pass through unchanged:
