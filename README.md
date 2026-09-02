@@ -239,3 +239,36 @@ cost_breakdown("week", by="day")
 ```
 
 Cost history is lightweight and in memory for the current Python process.
+
+## Provider benchmarks
+
+`benchmark` compares exact provider/model routes with the same workload. A
+concurrency of 1 is sequential; larger values are bounded parallel batches.
+It prints a Markdown table and returns every aggregate and per-request metric.
+
+```python
+from litlm import benchmark
+
+results = benchmark(
+    [
+        "nvidia_nim/moonshotai/kimi-k3",
+        "nvidia_nim/deepseek-ai/deepseek-v4-pro-0813",
+        "albert/deepseek-v4-flash",
+    ],
+    requests=8,
+    concurrency=(1, 4, 8),
+    max_tokens=32,
+    timeout=120,
+)
+
+# Useful in notebooks, scripts, and agent handoffs.
+results.to_markdown()
+results.save_markdown("benchmarks/BENCHMARK_RESULTS.md", notes="Short response workload.")
+results[0]["latencies_s"]
+```
+
+The table reports success count, whole-workload time, mean/p50/p95 end-to-end
+latency, successful requests per second, and output tokens per second. Exact
+routes are important: a bare model name may use litlm's normal provider fallback
+chain. API keys are read from the existing provider environment variables and
+are never included in the result rows or report.

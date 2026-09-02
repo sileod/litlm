@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Union
 import appdirs
 import os, logging, sys
+import time
 from litlm_providers import _fallback_models, _litellm_model
 
 # suppression of annoying messages
@@ -251,6 +252,7 @@ class Text(str):
         rc = getattr(msg, "reasoning_content", None) or psf.get("reasoning_content")
         obj.reasoning = obj.reasoning_content = rc
         obj.failed = False
+        obj.latency_s = getattr(response, "_litlm_latency_s", None)
         return obj
     def __getattr__(self, name): return getattr(self._r, name)
     def __repr__(self): return super().__repr__()
@@ -261,6 +263,7 @@ class Failure(str):
         obj = super().__new__(cls, "")
         obj.error, obj.call_id, obj.prompt = error, call_id, prompt
         obj.model_used, obj.cost, obj.failed = model, 0.0, True
+        obj.latency_s = getattr(error, "_litlm_latency_s", None)
         return obj
 
 class BatchResult(list):
@@ -490,6 +493,7 @@ def complete(
                 if wait > 0: await asyncio.sleep(wait)
                 _next[0] = max(now, _next[0]) + _interval
         async def _one(r):
+            started = time.perf_counter()
             await _throttle()
             last = None
             for m in models:
@@ -515,6 +519,8 @@ def complete(
                             if attempt_timeout else await request
                         )
                         try: res._litlm_model_used = m
+                        except Exception: pass
+                        try: res._litlm_latency_s = time.perf_counter() - started
                         except Exception: pass
                         _record_cost(res, m)
                         if debug:
@@ -562,6 +568,8 @@ def complete(
                         break
             if last is None:
                 last = RuntimeError("all configured fallback routes are disabled")
+            try: last._litlm_latency_s = time.perf_counter() - started
+            except Exception: pass
             raise last from None
         if max_concurrency and max_concurrency > 0:
             _sem = asyncio.Semaphore(int(max_concurrency))
@@ -575,9 +583,12 @@ def complete(
             batch_cost = 0.0
             async def _settled(i, task):
                 try:
-                    return i, await task
+                    response = await task
                 except Exception as error:
-                    return i, error
+                    response = error
+                # Wrap and notify in the settling task so callbacks observe true
+                # completion order rather than as_completed() iteration order.
+                return i, _wrap_result(i, response)
 
             pending = [_settled(i, task) for i, task in enumerate(tasks)]
             settled = asyncio.as_completed(pending)
@@ -587,8 +598,7 @@ def complete(
             errors = []
             try:
                 for future in bar:
-                    i, response = await future
-                    result = _wrap_result(i, response)
+                    i, result = await future
                     results[i] = result
                     completed += 1
                     if result.failed:
@@ -658,3 +668,190 @@ def complete(
 
 # Alias for explicit OpenRouter intent (optional, since complete handles it now)
 or_complete = complete
+
+
+# --- Benchmarks ---
+def _percentile(values, percentile):
+    """Linearly interpolated percentile without a NumPy dependency."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * percentile / 100.0
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    fraction = position - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
+
+
+def _output_tokens(result):
+    usage = getattr(result, "usage", None)
+    for name in ("completion_tokens", "output_tokens"):
+        value = _get(usage, name)
+        if value is not None:
+            return int(value)
+    return 0
+
+
+class BenchmarkResult(list):
+    """List-compatible benchmark rows with Markdown and notebook table renderers."""
+    columns = (
+        "provider", "model", "mode", "concurrency", "success",
+        "wall_s", "mean_s", "p50_s", "p95_s", "req_s", "tok_s", "error",
+    )
+
+    def to_markdown(self):
+        def display(value):
+            if value is None:
+                return "-"
+            if isinstance(value, float):
+                return f"{value:.3f}"
+            return str(value)
+
+        header = "| " + " | ".join(self.columns) + " |"
+        divider = "| " + " | ".join("---" for _ in self.columns) + " |"
+        lines = [header, divider]
+        lines.extend(
+            "| " + " | ".join(display(row.get(column)) for column in self.columns) + " |"
+            for row in self
+        )
+        return "\n".join(lines)
+
+    def _repr_html_(self):
+        import html
+        head = "".join(f"<th>{html.escape(column)}</th>" for column in self.columns)
+        body = "".join(
+            "<tr>" + "".join(
+                f"<td>{html.escape(str(row.get(column, '')))}</td>"
+                for column in self.columns
+            ) + "</tr>"
+            for row in self
+        )
+        return f"<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>"
+
+    def __str__(self):
+        return self.to_markdown()
+
+    def save_markdown(self, path, title="litlm benchmark results", notes=None):
+        """Write a standalone report and return its path."""
+        path = Path(path)
+        lines = [
+            f"# {title}",
+            "",
+            f"Generated {datetime.now().astimezone().isoformat(timespec='seconds')}.",
+            "",
+        ]
+        if notes:
+            lines.extend([str(notes).strip(), ""])
+        lines.extend([
+            self.to_markdown(),
+            "",
+            "`mean_s`, `p50_s`, and `p95_s` are end-to-end request latency; "
+            "`req_s` and `tok_s` use whole-scenario wall time.",
+            "",
+        ])
+        path.write_text("\n".join(lines), encoding="utf-8")
+        return path
+
+
+def benchmark(
+    models: Union[str, Sequence[str]],
+    prompt: Any = "Reply with exactly: OK",
+    requests: int = 8,
+    concurrency: Sequence[int] = (1, 4, 8),
+    warmup: int = 0,
+    show_table: bool = True,
+    **completion_kwargs: Any,
+) -> BenchmarkResult:
+    """Benchmark provider/model routes under sequential and parallel workloads.
+
+    Each scenario sends ``requests`` identical prompts. Concurrency 1 measures a
+    sequential workload; larger values measure bounded parallel workloads.
+    Retries, caching, and progress are disabled by default. Pass an explicit
+    provider-prefixed model to prevent normal bare-model fallback routing from
+    mixing providers in a comparison.
+
+    Rows contain aggregate metrics plus ``latencies_s``, ``output_tokens``,
+    ``cost``, ``failures``, and ``routes`` for programmatic analysis.
+    """
+    if isinstance(models, str):
+        models = [models]
+    else:
+        models = list(models)
+    levels = [int(value) for value in concurrency]
+    if not models:
+        raise ValueError("models must contain at least one provider/model route")
+    if requests < 1:
+        raise ValueError("requests must be at least 1")
+    if warmup < 0:
+        raise ValueError("warmup cannot be negative")
+    if not levels or any(value < 1 for value in levels):
+        raise ValueError("concurrency values must be positive integers")
+
+    options = dict(completion_kwargs)
+    options.setdefault("show_progress", False)
+    options.setdefault("caching", False)
+    options.setdefault("num_retries", 0)
+    if "max_concurrency" in options:
+        raise TypeError("benchmark() controls max_concurrency via concurrency")
+
+    rows = BenchmarkResult()
+    for requested_model in models:
+        for _ in range(warmup):
+            complete(prompt, model=requested_model, **options)
+
+        for level in levels:
+            started = time.perf_counter()
+            results = complete(
+                [prompt for _ in range(requests)],
+                model=requested_model,
+                max_concurrency=level,
+                **options,
+            )
+            wall_s = time.perf_counter() - started
+            successes = [result for result in results if not result.failed]
+            latencies = [
+                result.latency_s for result in successes
+                if result.latency_s is not None
+            ]
+            tokens = sum(_output_tokens(result) for result in successes)
+            routes = sorted(set(result.model_used for result in successes))
+            route = routes[0] if len(routes) == 1 else ", ".join(routes)
+            provider, _, model_name = (route or requested_model).partition("/")
+            if not model_name:
+                model_name = provider
+                provider = "resolved"
+            success_count = len(successes)
+            failures = [result for result in results if result.failed]
+            error_counts = {}
+            for failure in failures:
+                name = type(failure.error).__name__
+                error_counts[name] = error_counts.get(name, 0) + 1
+            rows.append({
+                "provider": provider,
+                "model": model_name,
+                "requested_model": requested_model,
+                "mode": "sequential" if level == 1 else "parallel",
+                "concurrency": level,
+                "requests": requests,
+                "successes": success_count,
+                "failures": len(failures),
+                "success": f"{success_count}/{requests}",
+                "wall_s": wall_s,
+                "mean_s": sum(latencies) / len(latencies) if latencies else None,
+                "p50_s": _percentile(latencies, 50),
+                "p95_s": _percentile(latencies, 95),
+                "req_s": success_count / wall_s if wall_s else 0.0,
+                "tok_s": tokens / wall_s if wall_s else 0.0,
+                "output_tokens": tokens,
+                "cost": sum(float(result.cost or 0) for result in successes),
+                "latencies_s": latencies,
+                "routes": routes,
+                "errors": error_counts,
+                "error": ", ".join(
+                    f"{name}×{count}" for name, count in error_counts.items()
+                ) or "-",
+            })
+
+    if show_table:
+        print(rows.to_markdown())
+    return rows
