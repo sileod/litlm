@@ -98,3 +98,13 @@ def test_cli_param_parses_json_values(capsys):
     assert capsys.readouterr().out == "OK\n"
     assert complete.call_args.kwargs["top_p"] == 0.8
     assert complete.call_args.kwargs["seed"] == 42
+
+
+def test_cli_param_cannot_duplicate_explicit_option():
+    with patch.object(litlm_cli, "complete"):
+        try:
+            litlm_cli.main(["hello", "--param", "model=other"])
+        except SystemExit as error:
+            assert error.code == 2
+        else:
+            raise AssertionError("expected argparse error")
