@@ -76,9 +76,16 @@ def _inputs(args, parser):
         if not lines:
             parser.error("--input-jsonl requires JSON values on stdin")
         try:
-            return [json.loads(line) for line in lines], True
+            values = [json.loads(line) for line in lines]
         except json.JSONDecodeError as error:
             parser.error(f"invalid JSONL input: {error}")
+        if all(isinstance(value, str) for value in values):
+            return values, True
+        if all(isinstance(value, (dict, list)) for value in values):
+            conversations = [value if isinstance(value, list) else [value] for value in values]
+            if all(all(isinstance(message, dict) for message in conversation) for conversation in conversations):
+                return conversations, True
+        parser.error("JSONL lines must all be strings or message conversations")
 
     if args.prompt:
         return " ".join(args.prompt), False
