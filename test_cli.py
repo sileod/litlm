@@ -66,6 +66,20 @@ def test_cli_jsonl_batch_defaults_to_jsonl(monkeypatch, capsys):
     assert complete.call_args.args == (["a", "b"],)
 
 
+def test_cli_jsonl_message_objects_become_batch_conversations(monkeypatch, capsys):
+    source = '{"role":"user","content":"a"}\n{"role":"user","content":"b"}\n'
+    monkeypatch.setattr(litlm_cli.sys, "stdin", io.StringIO(source))
+    with patch.object(litlm_cli, "complete", return_value=[Result("A"), Result("B")]) as complete:
+        code = litlm_cli.main(["--input-jsonl"])
+
+    assert code == 0
+    capsys.readouterr()
+    assert complete.call_args.args == ([
+        [{"role": "user", "content": "a"}],
+        [{"role": "user", "content": "b"}],
+    ],)
+
+
 def test_cli_failure_sets_nonzero_exit(capsys):
     with patch.object(litlm_cli, "complete", return_value=Result("", failed=True)):
         code = litlm_cli.main(["hello", "--output", "json"])
