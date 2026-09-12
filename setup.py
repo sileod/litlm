@@ -8,7 +8,7 @@ setup(
     long_description_content_type="text/markdown",
     author="Damien Sileo",
     url="https://github.com/sileod/litlm",
-    py_modules=["litlm", "litlm_providers"],
+    py_modules=["litlm", "litlm_providers", "litlm_cli"],
     install_requires=[
         "litellm",
         "tqdm",          # Required for progress bars
@@ -16,6 +16,7 @@ setup(
         "appdirs",       # Required for cross-platform cache paths
         "nest_asyncio",  # Required for Jupyter/Loop patching
     ],
+    entry_points={"console_scripts": ["litlm=litlm_cli:main"]},
     classifiers=[
         "License :: OSI Approved :: MIT License",
         "Programming Language :: Python",
