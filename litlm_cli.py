@@ -52,9 +52,9 @@ def _record(result):
     data = {
         "text": str(result) if isinstance(result, str) else None,
         "model": getattr(result, "model_used", None),
-        "cost": getattr(result, "cost", None),
+        "cost": _jsonable(getattr(result, "cost", None)),
         "usage": _jsonable(getattr(result, "usage", None)),
-        "reasoning": getattr(result, "reasoning", None),
+        "reasoning": _jsonable(getattr(result, "reasoning", None)),
         "failed": failed,
     }
     if failed:
@@ -175,8 +175,11 @@ def main(argv=None):
         reasoning_effort=args.reasoning_effort,
         temperature=args.temperature,
         fallbacks=args.fallbacks,
-        **kwargs,
     )
+    duplicate = set(call) & set(kwargs)
+    if duplicate:
+        parser.error(f"--param duplicates explicit option: {sorted(duplicate)[0]}")
+    call.update(kwargs)
 
     try:
         if args.debug:
