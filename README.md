@@ -32,6 +32,29 @@ os.environ["NVIDIA_NIM_API_KEY"] = "nvapi-..."      # optional
 os.environ["ALBERT_API_KEY"] = "..."                # optional
 ```
 
+## Command line
+
+Installation also provides a thin `litlm` command that delegates to `complete()`:
+
+```bash
+litlm "Explain transformers briefly"
+printf 'Explain transformers briefly' | litlm
+litlm "Hello" --model gpt-4.1-mini
+litlm "Hello" --output json
+```
+
+Text output contains only the answer on stdout. Progress, debug output, and errors go to stderr, so shell pipelines and agent subprocesses can consume stdout directly. `--output json` returns a stable envelope with `text`, `model`, `cost`, `usage`, `reasoning`, and `failed` fields.
+
+JSONL stdin runs a batch and defaults to JSONL output:
+
+```bash
+printf '"Capital of France?"\n"Capital of Japan?"\n' | litlm --input-jsonl
+```
+
+Each JSONL line may be a JSON string, a message object, or a conversation represented as an array of message objects. A batch must use one input shape consistently. Any failed batch item makes the process exit nonzero while preserving successful output rows.
+
+`--json` is separate from `--output json`: it asks the model for JSON and parses the response, while `--output` controls the CLI serialization. Common `complete()` controls are exposed as matching flags; additional LiteLLM arguments can be passed with repeatable `--param KEY=VALUE` options.
+
 ## Why litlm
 
 - A string in, a string-like result out.
