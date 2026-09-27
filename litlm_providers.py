@@ -180,7 +180,7 @@ def _fallback_models(model):
     nvidia_slug = _nvidia_slug(paid_slug)
     nvidia_models = _fetch_nvidia_models(
         os.environ.get("NVIDIA_NIM_API_BASE", "https://integrate.api.nvidia.com/v1"),
-        os.environ.get("NVIDIA_NIM_API_KEY"))
+        os.environ.get("NVIDIA_NIM_API_KEY") or os.environ.get("NVIDIA_API_KEY"))
     nvidia = [f"nvidia_nim/{nvidia_slug}"] if nvidia_slug in nvidia_models else []
 
     # 3) direct Gemini BYOK, before any OpenRouter route.

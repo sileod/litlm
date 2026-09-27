@@ -21,6 +21,9 @@ warnings.filterwarnings("ignore", category=UserWarning, module="pydantic.*")
 warnings.filterwarnings("ignore", message=".*Expected.*serialized value may not be as expected.*")
 logging.getLogger("LiteLLM").setLevel(logging.ERROR)
 litellm.suppress_debug_info = True
+if "NVIDIA_NIM_API_KEY" not in os.environ and "NVIDIA_API_KEY" in os.environ:
+    os.environ["NVIDIA_NIM_API_KEY"] = os.environ["NVIDIA_API_KEY"]
+
 
 def extract_answer(s, tag="answer"):
     first_tag, last_tag = f"<{tag}>", f"</{tag}>"
@@ -177,7 +180,7 @@ def _with_provider_env(model, kwargs):
     call_kwargs = dict(kwargs)
     call_kwargs.pop("debug", None)
     if model.startswith("nvidia_nim/"):
-        call_kwargs.setdefault("api_key", os.environ.get("NVIDIA_NIM_API_KEY"))
+        call_kwargs.setdefault("api_key", os.environ.get("NVIDIA_NIM_API_KEY") or os.environ.get("NVIDIA_API_KEY"))
         if "api_base" not in call_kwargs and "base_url" not in call_kwargs:
             call_kwargs["api_base"] = os.environ.get("NVIDIA_NIM_API_BASE")
         call_kwargs = _normalize_reasoning(call_kwargs)
