@@ -1,6 +1,6 @@
 # litlm
 
-`litlm` is a small, notebook-first interface to [LiteLLM](https://github.com/BerriAI/litellm). One function handles a prompt or a parallel batch, while keeping costs, provider metadata, failures, and retries close at hand.
+`litlm` is a small interface to [LiteLLM](https://github.com/BerriAI/litellm). It is notebook-first and also works well for coding agents. One function handles a single prompt or a parallel batch, and keeps costs, provider metadata, failures, and retries close at hand.
 
 ```python
 from litlm import complete
@@ -15,6 +15,13 @@ answers = complete(
 ```
 
 It is designed for exploratory work where the full SDK response is useful, but SDK ceremony is not.
+
+The same property makes it cheap for coding agents. An agent that needs LLM calls
+can run a single `litlm` command or `complete()` call instead of writing and
+debugging a LiteLLM script with async batching, retries, key lookups, JSON
+parsing, and checkpoints. Output stays compact: answers go to stdout, and a
+one-line summary replaces pages of tracebacks. See [AGENTS.md](AGENTS.md) for
+the agent-facing guide.
 
 ## Install
 
@@ -55,12 +62,40 @@ Each JSONL line may be a JSON string, a message object, or a conversation repres
 
 `--json` is separate from `--output json`: it asks the model for JSON and parses the response, while `--output` controls the CLI serialization. Common `complete()` controls are exposed as matching flags; additional LiteLLM arguments can be passed with repeatable `--param KEY=VALUE` options.
 
+### For agents and long batches
+
+```bash
+# One prompt per line from a file; records are checkpointed as they settle.
+litlm --lines -i prompts.txt -o answers.jsonl
+# -> 998/1000 ok (0 reused), 2 failed, cost=$0.041210 -> answers.jsonl
+
+# Rerun the same command to retry only failed or missing items.
+litlm --lines -i prompts.txt -o answers.jsonl
+# -> 1000/1000 ok (998 reused), 0 failed, cost=$0.041290 -> answers.jsonl
+
+# Fill a template from JSONL rows and normalize each answer to one label.
+litlm -i reviews.jsonl -t 'Review: {text}' --choices positive,negative --output text
+
+# Keep only the fields you need on stdout.
+litlm --lines -i prompts.txt --fields text,cost
+
+litlm --routes -m deepseek-v4-flash   # provider routes a bare name resolves to
+litlm --doctor                        # which provider keys are set (never their values)
+```
+
+With `--out`, stdout carries only the summary line. Each record includes its
+`index` and a key derived from the input and prompt options, so a changed input
+line is recomputed instead of silently reused. The exit status is nonzero while
+any item is still failed or missing.
+
 ## Why litlm
 
 - A string in, a string-like result out.
 - Lists, NumPy arrays, and Pandas Series run as ordered async batches.
 - Compact progress shows cost and a bounded error breakdown.
 - Partial batches stay usable and can retry only failed positions.
+- `template=` and `choices=` cover the common "fill rows, classify" batch without extra code.
+- `summary()`, `routes()`, `doctor()`, and the CLI give compact output that suits agent contexts.
 - Results expose usage, reasoning, cost, model, and the raw LiteLLM response.
 - Bare model names can resolve through free and paid provider fallbacks.
 - The typed signature and docstring work well with Jupyter completion and Shift-Tab help.
@@ -200,6 +235,25 @@ answer = complete(
 )
 ```
 
+Fill a template from rows (dicts, a DataFrame, or plain values via `{input}`),
+and constrain answers to a label set:
+
+```python
+labels = complete(
+    df,                                   # or a list of dicts
+    template="Review: {text}\nSentiment?",
+    choices=["positive", "negative", "neutral"],
+    max_tokens=8,
+)
+labels.summary()   # '1000/1000 ok | cost=$0.012 | routes: openrouter/...×1000'
+```
+
+Every successful item is exactly one of the labels, and `.raw_text` keeps the
+model's original reply. A reply that names no label, or several, becomes a
+`Failure`, so `labels.resume()` retries only those items. With a template, a
+list of dicts is a batch of rows, not a conversation. Literal braces in a
+template must be doubled (`{{` and `}}`).
+
 Request and parse JSON directly:
 
 ```python
@@ -208,6 +262,9 @@ data = complete(
     json=True,
 )
 ```
+
+In a batch, a reply that cannot be parsed becomes a resumable `Failure`
+instead of aborting the whole batch. A scalar call still raises `ValueError`.
 
 Throttle large batches by concurrency or request starts per minute:
 

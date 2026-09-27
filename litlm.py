@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Union
 import appdirs
-import os, logging, sys
+import os, logging, re, sys
 import time
 from litlm_providers import _fallback_models, _litellm_model
 
@@ -197,6 +197,82 @@ def _with_provider_env(model, kwargs):
     return {k: v for k, v in call_kwargs.items() if v is not None}
 
 
+def _fill(template, value):
+    if isinstance(value, dict):
+        return template.format(**value)
+    return template.format(value, input=value)
+
+
+def _apply_template(inputs, template):
+    """Render rows (DataFrame, dicts, or scalars) into prompt strings."""
+    if hasattr(inputs, "to_dict") and hasattr(inputs, "columns"):
+        inputs = inputs.to_dict("records")
+    elif hasattr(inputs, "tolist"):
+        inputs = inputs.tolist()
+    if isinstance(inputs, (str, dict)):
+        return _fill(template, inputs)
+    return [_fill(template, value) for value in inputs]
+
+
+def _choices_instruction(choices):
+    return "Answer with exactly one of: " + ", ".join(str(c) for c in choices) + "."
+
+
+def _with_instruction(msgs, instruction):
+    """Append an instruction to the last user message once (idempotent across resume)."""
+    msgs = [dict(m) for m in msgs]
+    for m in reversed(msgs):
+        if m.get("role") == "user" and isinstance(m.get("content"), str):
+            if instruction not in m["content"]:
+                m["content"] = f"{m['content']}\n\n{instruction}"
+            break
+    return msgs
+
+
+def match_choice(text, choices):
+    """Map a model reply to one of `choices`: exact (case-insensitive) match, else the only
+    choice mentioned as a whole word. Raises ValueError when absent or ambiguous."""
+    cleaned = str(text).strip().strip("`*\"'.").strip().lower()
+    for choice in choices:
+        if cleaned == str(choice).lower():
+            return choice
+    found = [
+        choice for choice in choices
+        if re.search(r"(?<!\w)" + re.escape(str(choice)) + r"(?!\w)", str(text), re.I)
+    ]
+    if len(found) == 1:
+        return found[0]
+    reason = "ambiguous" if found else "no choice"
+    raise ValueError(f"{reason} in reply (choices={list(choices)}): {_crop(' '.join(str(text).split()), 120)!r}")
+
+
+def routes(model: str = "openrouter/openai/gpt-4.1-nano", fallbacks: Optional[Sequence[str]] = None) -> List[str]:
+    """Ordered provider routes `complete()` would try for `model` (no completion is requested)."""
+    if fallbacks is None:
+        return _fallback_models(model)
+    if isinstance(fallbacks, str) or not fallbacks:
+        raise ValueError("fallbacks must be a non-empty sequence of exact routes")
+    out = []
+    for route in fallbacks:
+        out.extend(_fallback_models(route))
+    return list(dict.fromkeys(out))
+
+
+_PROVIDER_KEYS = {
+    "openrouter": ("OPENROUTER_API_KEY",),
+    "nvidia_nim": ("NVIDIA_NIM_API_KEY", "NVIDIA_API_KEY"),
+    "albert": ("ALBERT_API_KEY",),
+    "gemini": ("GEMINI_API_KEY",),
+    "openai": ("OPENAI_API_KEY",),
+    "anthropic": ("ANTHROPIC_API_KEY",),
+}
+
+
+def doctor() -> Dict[str, bool]:
+    """Which provider API keys are set (values are never read out)."""
+    return {name: any(os.environ.get(k) for k in keys) for name, keys in _PROVIDER_KEYS.items()}
+
+
 def _cache_control(prompt_cache, cache_control):
     if cache_control is not None: return cache_control
     if isinstance(prompt_cache, dict): return prompt_cache
@@ -279,6 +355,23 @@ class BatchResult(list):
     def failures(self):
         """Failures still present in this batch (resolved failures are excluded)."""
         return [item for item in self if getattr(item, "failed", False)]
+
+    def summary(self, max_types: int = 2) -> str:
+        """One-line status: counts, cost, routes, and grouped errors (cheap to print or log)."""
+        failures = self.failures
+        ok = len(self) - len(failures)
+        cost = sum(float(getattr(x, "cost", 0) or 0) for x in self if not getattr(x, "failed", False))
+        parts = [f"{ok}/{len(self)} ok", f"cost=${cost:.6f}"]
+        used = {}
+        for x in self:
+            if not getattr(x, "failed", False) and getattr(x, "model_used", None):
+                used[x.model_used] = used.get(x.model_used, 0) + 1
+        if used:
+            parts.append("routes: " + ", ".join(f"{m}×{n}" for m, n in used.items()))
+        if failures:
+            parts.append(f"{len(failures)} failed: " + _compact_error_breakdown(
+                [f.error for f in failures], max_types=max_types, max_chars=160))
+        return " | ".join(parts)
 
     def resume(
         self,
@@ -391,6 +484,8 @@ def complete(
     temperature: Optional[float] = None,
     on_result: Optional[Callable[[int, Union[Text, Failure]], None]] = None,
     fallbacks: Optional[Sequence[str]] = None,
+    template: Optional[str] = None,
+    choices: Optional[Sequence[str]] = None,
     **kwargs: Any,
 ) -> Union[Text, Failure, BatchResult, Dict[str, Any], List[Any]]:
     """Complete one prompt or an ordered batch with a synchronous, notebook-friendly API.
@@ -420,12 +515,28 @@ def complete(
             ``Failure`` result. Callback exceptions abort ``complete``.
         fallbacks: Optional exact, ordered route list. When omitted, a bare
             model uses litlm's free/BYOK-first provider hierarchy.
+        template: Optional ``str.format`` template. Dict rows and DataFrame
+            rows fill named fields; scalars fill ``{}`` or ``{input}``. With a
+            template, a list of dicts is a batch of rows, not a conversation.
+        choices: Optional label set. The model is told to answer with one
+            label and each result is normalized to exactly that label; replies
+            with no or several labels become ``Failure`` items (resumable).
         **kwargs: Additional LiteLLM/provider parameters.
 
     Returns:
         A Text-like scalar for one prompt, or a list-compatible BatchResult. Call
-        ``batch.resume(timeout=...)`` to retry only failed batch positions in place.
+        ``batch.resume(timeout=...)`` to retry only failed batch positions in place,
+        and ``batch.summary()`` for a one-line status. In a batch, replies that
+        fail ``json``/``choices`` parsing are ``Failure`` items; a scalar raises.
     """
+    if json and choices is not None:
+        raise ValueError("json and choices cannot be combined")
+    if choices is not None:
+        if isinstance(choices, str) or not choices:
+            raise ValueError("choices must be a non-empty sequence of labels")
+        choices = list(choices)
+    if template is not None:
+        inputs = _apply_template(inputs, template)
     debug = bool(debug or kwargs.pop("debug", False))
     if reasoning_effort is not None:
         kwargs["reasoning_effort"] = reasoning_effort
@@ -450,6 +561,8 @@ def complete(
             reqs = [_messages(i) for i in inputs]
     else: raise ValueError("Input must be string, list, dict, or pandas object.")
     reqs = [_messages(r, system) for r in reqs]
+    if choices is not None:
+        reqs = [_with_instruction(r, _choices_instruction(choices)) for r in reqs]
 
     call_id = len(_HISTORY)
 
@@ -466,21 +579,23 @@ def complete(
                 call_id,
                 reqs[index],
             )
+            try:
+                if choices is not None:
+                    raw = str(result)
+                    result = Text(str(match_choice(raw, choices)), response, call_id, reqs[index])
+                    result.raw_text = raw
+                elif json:
+                    result.data = extract_json(str(result))
+            except ValueError as error:
+                result = Failure(error, call_id, reqs[index], result.model_used)
+                _FAILURES.append(result)
         if on_result is not None:
             on_result(index, result)
         return result
 
     # Async Runner
     async def _runner():
-        if fallbacks is None:
-            models = _fallback_models(model)
-        else:
-            if isinstance(fallbacks, str) or not fallbacks:
-                raise ValueError("fallbacks must be a non-empty sequence of exact routes")
-            models = []
-            for route in fallbacks:
-                models.extend(_fallback_models(route))
-            models = list(dict.fromkeys(models))
+        models = routes(model, fallbacks)
         if debug:
             print(f"litlm fallback models: {models}")
         disabled_routes = set()
@@ -631,6 +746,8 @@ def complete(
         r if isinstance(r, (Text, Failure)) else _wrap_result(index, r)
         for index, r in enumerate(raw)
     ]
+    if not is_batch and out[0].failed:
+        raise out[0].error
     failed = sum(x.failed for x in out)
     if failed:
         call_failures = [x for x in out if x.failed]
@@ -641,7 +758,7 @@ def complete(
             f"litlm: inspect the full error with litlm.get_failure({call_id})",
         ]
         print("\n".join(summary), file=sys.stderr)
-    res = [x if x.failed else extract_json(str(x)) for x in out] if json else out
+    res = [x if x.failed else x.data for x in out] if json else out
     if is_batch:
         resume_options = {
             "model": model,
@@ -661,6 +778,7 @@ def complete(
             "temperature": temperature,
             "on_result": on_result,
             "fallbacks": fallbacks,
+            "choices": choices,
             **kwargs,
         }
         res = BatchResult(res, resume_options=resume_options)

@@ -3,7 +3,7 @@ from setuptools import setup
 setup(
     name="litlm",
     version="0.6.0",
-    description="Notebook-first LiteLLM wrapper with parallel, resumable batches",
+    description="Notebook-first, agent-friendly LiteLLM wrapper with parallel, resumable batches",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
     author="Damien Sileo",

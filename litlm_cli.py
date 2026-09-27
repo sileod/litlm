@@ -1,9 +1,12 @@
 import argparse
+import hashlib
 import json
+import os
 import sys
 from contextlib import redirect_stdout
+from pathlib import Path
 
-from litlm import complete
+from litlm import complete, doctor, routes
 
 
 DEFAULT_MODEL = "openrouter/openai/gpt-4.1-nano"
@@ -65,22 +68,48 @@ def _record(result):
         }
     elif isinstance(result, (dict, list)):
         data["data"] = _jsonable(result)
+    elif "data" in getattr(result, "__dict__", {}):
+        # Text settled with json=True (seen by on_result before parsing is unwrapped).
+        data["data"] = _jsonable(result.data)
     return data
 
 
+def _select(record, fields):
+    if not fields:
+        return record
+    return {k: v for k, v in record.items() if k in fields or k == "index"}
+
+
+def _read_batch(args):
+    if args.input and args.input != "-":
+        return Path(args.input).read_text(encoding="utf-8")
+    return sys.stdin.read()
+
+
 def _inputs(args, parser):
-    if args.input_jsonl:
+    if args.lines and args.input_jsonl:
+        parser.error("--lines and --input-jsonl are mutually exclusive")
+    if args.input or args.input_jsonl or args.lines:
         if args.prompt:
-            parser.error("--input-jsonl cannot be combined with a positional prompt")
-        lines = [line for line in sys.stdin.read().splitlines() if line.strip()]
+            parser.error("batch input cannot be combined with a positional prompt")
+        try:
+            lines = [line for line in _read_batch(args).splitlines() if line.strip()]
+        except OSError as error:
+            parser.error(f"cannot read --input: {error}")
         if not lines:
-            parser.error("--input-jsonl requires JSON values on stdin")
+            parser.error("batch input is empty")
+        if args.lines:
+            return lines, True
         try:
             values = [json.loads(line) for line in lines]
         except json.JSONDecodeError as error:
             parser.error(f"invalid JSONL input: {error}")
         if all(isinstance(value, str) for value in values):
             return values, True
+        if args.template:
+            if all(isinstance(value, (str, dict)) for value in values):
+                return values, True
+            parser.error("with --template, JSONL lines must be strings or objects")
         if all(isinstance(value, (dict, list)) for value in values):
             conversations = [value if isinstance(value, list) else [value] for value in values]
             if all(all(isinstance(message, dict) for message in conversation) for conversation in conversations):
@@ -99,7 +128,15 @@ def _inputs(args, parser):
 def _parser():
     parser = argparse.ArgumentParser(
         prog="litlm",
-        description="Small command-line interface to litlm.complete().",
+        description="Small command-line interface to litlm.complete(). "
+        "Answers go to stdout; progress, summaries, and errors go to stderr.",
+        epilog="examples:\n"
+        "  litlm 'Capital of France?'\n"
+        "  litlm --lines --input prompts.txt --out answers.jsonl   # checkpointed, rerun to resume\n"
+        "  litlm --input rows.jsonl --template 'Review: {text}' --choices pos,neg --fields text\n"
+        "  litlm --routes -m deepseek-v4-flash\n"
+        "  litlm --doctor",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("prompt", nargs="*", help="prompt text; stdin is used when omitted")
     parser.add_argument("-m", "--model", default=DEFAULT_MODEL)
@@ -107,6 +144,18 @@ def _parser():
     parser.add_argument("--json", action="store_true", help="request and parse JSON output")
     parser.add_argument("--output", choices=("text", "json", "jsonl"))
     parser.add_argument("--input-jsonl", action="store_true", help="read one JSON input per stdin line")
+    parser.add_argument("-i", "--input", metavar="PATH", help="read a batch from PATH (JSONL, or lines with --lines)")
+    parser.add_argument("--lines", action="store_true", help="each non-empty input line is a raw prompt")
+    parser.add_argument("-o", "--out", metavar="PATH",
+                        help="write JSONL records to PATH as items settle; rerunning skips finished items "
+                        "and prints only a one-line summary")
+    parser.add_argument("-t", "--template", help="str.format template; JSONL objects fill named fields, strings fill {input}")
+    parser.add_argument("--choices", type=lambda s: [c.strip() for c in s.split(",") if c.strip()],
+                        metavar="A,B,...", help="normalize each answer to exactly one label")
+    parser.add_argument("--fields", type=lambda s: {f.strip() for f in s.split(",") if f.strip()},
+                        metavar="F,...", help="keep only these JSON record fields on stdout, e.g. text,cost")
+    parser.add_argument("--routes", action="store_true", help="print the provider routes for --model and exit")
+    parser.add_argument("--doctor", action="store_true", help="print which provider keys are set and exit")
     parser.add_argument("--caching", action="store_true")
     parser.add_argument("--prompt-cache", nargs="?", const=True, default=False, type=_value)
     parser.add_argument("--cache-control", type=_value, metavar="JSON")
@@ -125,15 +174,18 @@ def _parser():
     return parser
 
 
-def _print(results, output, batch):
+def _print(results, output, batch, fields=None):
     values = list(results) if batch else [results]
     records = [_record(value) for value in values]
+    if batch:
+        records = [{"index": i, **record} for i, record in enumerate(records)]
+    shown = [_select(record, fields) for record in records]
 
     if output == "jsonl":
-        for record in records:
+        for record in shown:
             print(json.dumps(record, ensure_ascii=False))
     elif output == "json":
-        payload = records if batch else records[0]
+        payload = shown if batch else shown[0]
         print(json.dumps(payload, ensure_ascii=False))
     elif batch:
         for value in values:
@@ -143,12 +195,99 @@ def _print(results, output, batch):
     else:
         print(results)
 
+    if batch:
+        summary = getattr(results, "summary", None)
+        if callable(summary):
+            print(f"litlm: {summary()}", file=sys.stderr)
     return 1 if any(record["failed"] for record in records) else 0
+
+
+def _key(value, args):
+    spec = [value, args.template, args.choices, args.system, args.json]
+    blob = json.dumps(spec, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:12]
+
+
+def _load_checkpoint(path, keys):
+    done = {}
+    if not path.exists():
+        return done
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            record = json.loads(line)
+            index = record["index"]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            continue
+        if (isinstance(index, int) and 0 <= index < len(keys)
+                and record.get("key") == keys[index] and not record.get("failed")):
+            done[index] = record
+    return done
+
+
+def _run_checkpointed(inputs, call, args, path):
+    """Run only unfinished items, appending each record to `path` as it settles."""
+    keys = [_key(value, args) for value in inputs]
+    records = _load_checkpoint(path, keys)
+    reused = len(records)
+    pending = [i for i in range(len(inputs)) if i not in records]
+    error = None
+    if pending:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as sink:
+            def on_result(j, result):
+                i = pending[j]
+                record = {"index": i, "key": keys[i], **_record(result)}
+                records[i] = record
+                sink.write(json.dumps(record, ensure_ascii=False) + "\n")
+                sink.flush()
+
+            try:
+                if args.debug:
+                    with redirect_stdout(sys.stderr):
+                        complete([inputs[i] for i in pending], on_result=on_result, **call)
+                else:
+                    complete([inputs[i] for i in pending], on_result=on_result, **call)
+            except Exception as exc:
+                error = exc
+
+    # Compact the append log: one record per index, in input order.
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("w", encoding="utf-8") as sink:
+        for i in sorted(records):
+            sink.write(json.dumps(records[i], ensure_ascii=False) + "\n")
+    os.replace(tmp, path)
+
+    if error is not None:
+        print(f"litlm: {type(error).__name__}: {error}", file=sys.stderr)
+        return 1
+    values = list(records.values())
+    ok = sum(not r.get("failed") for r in values)
+    failed = sum(bool(r.get("failed")) for r in values)
+    missing = len(inputs) - len(values)
+    cost = sum(float(r.get("cost") or 0) for r in values if not r.get("failed"))
+    line = f"{ok}/{len(inputs)} ok ({reused} reused), {failed} failed"
+    if missing:
+        line += f", {missing} missing"
+    print(f"{line}, cost=${cost:.6f} -> {path}")
+    return 1 if failed or missing else 0
 
 
 def main(argv=None):
     parser = _parser()
     args = parser.parse_args(argv)
+    if args.doctor:
+        status = doctor()
+        for name, present in status.items():
+            print(f"{name}: {'set' if present else 'missing'}")
+        return 0 if any(status.values()) else 1
+    if args.routes:
+        try:
+            for route in routes(args.model, args.fallbacks):
+                print(route)
+        except Exception as error:
+            print(f"litlm: {type(error).__name__}: {error}", file=sys.stderr)
+            return 1
+        return 0
     inputs, batch = _inputs(args, parser)
     output = args.output or ("jsonl" if batch else "text")
 
@@ -175,11 +314,16 @@ def main(argv=None):
         reasoning_effort=args.reasoning_effort,
         temperature=args.temperature,
         fallbacks=args.fallbacks,
+        template=args.template,
+        choices=args.choices,
     )
     duplicate = set(call) & set(kwargs)
     if duplicate:
         parser.error(f"--param duplicates explicit option: {sorted(duplicate)[0]}")
     call.update(kwargs)
+
+    if args.out:
+        return _run_checkpointed(inputs if batch else [inputs], call, args, Path(args.out))
 
     try:
         if args.debug:
@@ -191,7 +335,7 @@ def main(argv=None):
         print(f"litlm: {type(error).__name__}: {error}", file=sys.stderr)
         return 1
 
-    return _print(result, output, batch)
+    return _print(result, output, batch, args.fields)
 
 
 if __name__ == "__main__":
