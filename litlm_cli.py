@@ -68,9 +68,13 @@ def _record(result):
         }
     elif isinstance(result, (dict, list)):
         data["data"] = _jsonable(result)
-    elif "data" in getattr(result, "__dict__", {}):
-        # Text settled with json=True (seen by on_result before parsing is unwrapped).
-        data["data"] = _jsonable(result.data)
+    else:
+        attrs = getattr(result, "__dict__", {})
+        if "data" in attrs:
+            # Text settled with json=True (seen by on_result before parsing is unwrapped).
+            data["data"] = _jsonable(attrs["data"])
+        if attrs.get("tool_calls"):
+            data["tool_calls"] = _jsonable(attrs["tool_calls"])
     return data
 
 
@@ -163,7 +167,7 @@ def _parser():
     parser.add_argument("--max-tokens", type=int, default=1024)
     parser.add_argument("--timeout", type=float, default=60)
     parser.add_argument("--attempt-timeout", type=float)
-    parser.add_argument("--max-concurrency", type=int)
+    parser.add_argument("--max-concurrency", type=int, default=64, help="0 means unbounded")
     parser.add_argument("--rpm", type=float)
     parser.add_argument("--reasoning-effort")
     parser.add_argument("--temperature", type=float)

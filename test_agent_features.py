@@ -114,3 +114,86 @@ def test_routes_and_doctor(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     status = litlm.doctor()
     assert status["gemini"] is True and status["anthropic"] is False
+
+
+# --- async API, tool calls, concurrency, import hygiene ---
+import inspect
+import subprocess
+import sys
+
+
+def test_sync_and_async_signatures_match():
+    assert inspect.signature(litlm.complete) == inspect.signature(litlm.acomplete)
+    assert "synchronously" in litlm.complete.__doc__
+
+
+def test_acomplete_runs_inside_a_running_loop_without_nest_asyncio():
+    async def main():
+        with patch.object(litlm, "acompletion", fake(lambda c: c * 2)):
+            batch = await litlm.acomplete(["a", "b"], model="openrouter/t", show_progress=False)
+            return batch, getattr(asyncio.get_running_loop(), "_nest_patched", False)
+
+    batch, patched = asyncio.run(main())
+    assert batch == ["aa", "bb"] and not patched
+
+
+def test_aresume_retries_failures_in_a_running_loop():
+    replies = iter(["no json", '{"ok": 1}'])
+
+    async def main():
+        with patch.object(litlm, "acompletion", fake(lambda c: '{"ok": 0}' if c == "a" else next(replies))), \
+                redirect_stderr(io.StringIO()):
+            batch = await litlm.acomplete(["a", "b"], model="openrouter/t", json=True, show_progress=False)
+            assert batch[1].failed
+            await batch.aresume()
+            return batch
+
+    assert asyncio.run(main()) == [{"ok": 0}, {"ok": 1}]
+
+
+def test_import_does_not_patch_asyncio_or_environment():
+    code = (
+        "import os, asyncio; before = dict(os.environ); import litlm; "
+        "assert dict(os.environ) == before; "
+        "assert not hasattr(asyncio, '_nest_patched'); print('ok')"
+    )
+    env = {k: v for k, v in __import__("os").environ.items() if k != "NVIDIA_NIM_API_KEY"}
+    env["NVIDIA_API_KEY"] = "x"
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env)
+    assert out.stdout.strip() == "ok", out.stderr
+
+
+def test_tool_calls_are_first_class():
+    call = SimpleNamespace(id="c1", type="function",
+                           function=SimpleNamespace(name="f", arguments='{"x": 1}'))
+
+    async def acompletion(**kwargs):
+        assert kwargs["tools"] == [{"type": "function"}]
+        message = SimpleNamespace(content=None, tool_calls=[call])
+        return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason="tool_calls")],
+                               usage=None, model="m", _hidden_params={})
+
+    with patch.object(litlm, "acompletion", acompletion):
+        answer = litlm.complete("hi", model="openrouter/t", tools=[{"type": "function"}])
+    assert answer == "" and answer.tool_calls == [call]
+    assert answer.finish_reason == "tool_calls"
+    assert answer.message.tool_calls == [call] and answer.raw.model == "m"
+
+
+def test_default_concurrency_is_bounded():
+    active = peak = 0
+
+    async def acompletion(**kwargs):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.001)
+        active -= 1
+        return _response("ok")
+
+    with patch.object(litlm, "acompletion", acompletion):
+        litlm.complete(["x"] * 200, model="openrouter/t", show_progress=False)
+        assert peak == 64
+        peak = 0
+        litlm.complete(["x"] * 200, model="openrouter/t", show_progress=False, max_concurrency=None)
+        assert peak == 200

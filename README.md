@@ -1,6 +1,6 @@
 # litlm
 
-`litlm` is a small interface to [LiteLLM](https://github.com/BerriAI/litellm). It is notebook-first and also works well for coding agents. One function handles a single prompt or a parallel batch, and keeps costs, provider metadata, failures, and retries close at hand.
+`litlm` is a small interface to [LiteLLM](https://github.com/BerriAI/litellm). It works well both interactively and for coding agents. One function handles a single prompt or a parallel batch, and keeps costs, provider metadata, failures, and retries close at hand.
 
 ```python
 from litlm import complete
@@ -14,9 +14,8 @@ answers = complete(
 )
 ```
 
-It is designed for exploratory work where the full SDK response is useful, but SDK ceremony is not.
-
-The same property makes it cheap for coding agents. An agent that needs LLM calls
+It is designed for work where the full SDK response is useful, but SDK
+ceremony is not. The same property makes it cheap for coding agents. An agent that needs LLM calls
 can run a single `litlm` command or `complete()` call instead of writing and
 debugging a LiteLLM script with async batching, retries, key lookups, JSON
 parsing, and checkpoints. Output stays compact: answers go to stdout, and a
@@ -98,7 +97,8 @@ any item is still failed or missing.
 - `summary()`, `routes()`, `doctor()`, and the CLI give compact output that suits agent contexts.
 - Results expose usage, reasoning, cost, model, and the raw LiteLLM response.
 - Bare model names can resolve through free and paid provider fallbacks.
-- The typed signature and docstring work well with Jupyter completion and Shift-Tab help.
+- `acomplete()` is the native async API; `complete()` is its synchronous wrapper.
+- The typed signature and docstring work well with editor completion and inline help.
 
 ## Results that remain simple
 
@@ -116,6 +116,18 @@ print(answer.call_id)
 ```
 
 Any other response field remains accessible through the same object.
+
+For tool use, the assistant message is first-class. litlm does not run an
+agent loop; it passes `tools=` through and exposes what came back:
+
+```python
+answer = complete(messages, tools=tools)
+
+answer.tool_calls      # [] when the model answered in text
+answer.message         # assistant message, ready to append to `messages`
+answer.finish_reason
+answer.raw             # the full LiteLLM response
+```
 
 Batch results behave like an ordinary `list`, so existing Python and Pandas code continues to work:
 
@@ -266,11 +278,32 @@ data = complete(
 In a batch, a reply that cannot be parsed becomes a resumable `Failure`
 instead of aborting the whole batch. A scalar call still raises `ValueError`.
 
-Throttle large batches by concurrency or request starts per minute:
+Throttle large batches by concurrency or request starts per minute.
+Batches run at most 64 requests at a time by default. Pass
+`max_concurrency=None` (or `0`) for unbounded concurrency:
 
 ```python
 answers = complete(inputs, max_concurrency=12, rpm=120)
 ```
+
+## Async
+
+In async code (agent runtimes, web servers), await `acomplete()`. It takes the
+same arguments and returns the same results:
+
+```python
+from litlm import acomplete
+
+answer = await acomplete("Hello")
+batch = await acomplete(prompts, choices=["yes", "no"])
+await batch.aresume()
+```
+
+The synchronous `complete()` runs on a private event loop. It applies
+`nest_asyncio` only when it is called from inside an already running loop, as
+in Jupyter; importing litlm patches nothing. LiteLLM's debug logging and a few
+pydantic serialization warnings are silenced by default. Set `LITLM_QUIET=0`
+before import to leave them untouched.
 
 Persist or stream results as soon as each item settles without coupling
 `litlm` to an application's storage format:
@@ -288,7 +321,7 @@ The callback receives the original input index and a `Text` or `Failure`.
 
 ## Caching
 
-Local response caching avoids paying twice for identical calls and survives notebook restarts:
+Local response caching avoids paying twice for identical calls and survives process restarts:
 
 ```python
 answer = complete("Expensive stable query", caching=True)
@@ -341,7 +374,7 @@ results = benchmark(
     timeout=120,
 )
 
-# Useful in notebooks, scripts, and agent handoffs.
+# Useful in reports, scripts, and agent handoffs.
 results.to_markdown()
 results.save_markdown("benchmarks/BENCHMARK_RESULTS.md", notes="Short response workload.")
 results[0]["latencies_s"]

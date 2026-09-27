@@ -16,6 +16,8 @@ summary line.
 | Classification | add `--choices a,b,c` (answers are exactly one label) |
 | Structured output | add `--json` (parsed into the record's `data` field) |
 | Inside Python | `complete(inputs, template=..., choices=..., json=...)` |
+| Inside async code | `await acomplete(...)` (same arguments) |
+| Tool calls | `complete(msgs, tools=...)`, then read `.tool_calls` and `.message` |
 
 ## Rules that save you tokens
 
@@ -35,15 +37,17 @@ summary line.
 - **Avoid paying twice across reruns:** use `caching=True` (Python) or
   `--caching` (CLI).
 - Keep `max_tokens` small for labels and short answers. For throughput, set
-  `--max-concurrency` and `--rpm` rather than writing your own loops.
+  `--max-concurrency` (default 64, 0 means unbounded) and `--rpm` rather than
+  writing your own loops.
 
 ## Contracts
 
 - stdout carries answers or records; progress, summaries, and errors go to stderr.
 - A batch record is `{"index", "text", "model", "cost", "usage", "reasoning",
-  "failed"}`, plus `"error": {"type", "message"}` when failed and `"data"` with
-  `--json`. Records in the `-o` file also carry a `"key"`, derived from the
-  input and prompt options, so changed inputs are recomputed.
+  "failed"}`, plus `"error": {"type", "message"}` when failed, `"data"` with
+  `--json`, and `"tool_calls"` when present. Records in the `-o` file also
+  carry a `"key"`, derived from the input and prompt options, so changed inputs
+  are recomputed.
 - Batch inputs: JSONL lines that are strings, message objects, or conversations
   (arrays of messages); or raw lines with `--lines`; or JSON objects as rows
   with `--template`. Literal braces in a template must be doubled (`{{ }}`).
@@ -72,6 +76,6 @@ data = complete(prompts, json=True, max_concurrency=16, on_result=save)  # strea
   (routing and fallbacks), `litlm_cli.py` (a thin CLI over `complete()`).
 - Tests: `python -m pytest -q`. They are offline and stub `litlm.acompletion`.
   Add new test files to `pytest.ini`.
-- Compatibility matters. Notebook users rely on `Text` behaving like `str`,
+- Compatibility matters. Existing users rely on `Text` behaving like `str`,
   `BatchResult` behaving like `list`, and the existing keyword arguments. Add
   options as new keywords with defaults that keep existing behavior.

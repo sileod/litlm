@@ -1,7 +1,12 @@
-# Save as litlm.py (or llm.py)
+"""litlm: a small, agent-friendly interface to LiteLLM.
+
+``complete()`` is synchronous and works in scripts and notebooks; ``acomplete()``
+is the native async API for async runtimes. Set ``LITLM_QUIET=0`` to keep
+LiteLLM's own logging and warnings untouched.
+"""
 import asyncio
 import json as jsonlib
-import nest_asyncio; nest_asyncio.apply()
+import threading
 import litellm
 from litellm import acompletion, Cache
 from tqdm.auto import tqdm as tq
@@ -15,14 +20,38 @@ import os, logging, re, sys
 import time
 from litlm_providers import _fallback_models, _litellm_model
 
-# suppression of annoying messages
-os.environ["PYDANTIC_ERRORS_OMIT_URL"] = "1"
-warnings.filterwarnings("ignore", category=UserWarning, module="pydantic.*")
-warnings.filterwarnings("ignore", message=".*Expected.*serialized value may not be as expected.*")
-logging.getLogger("LiteLLM").setLevel(logging.ERROR)
-litellm.suppress_debug_info = True
-if "NVIDIA_NIM_API_KEY" not in os.environ and "NVIDIA_API_KEY" in os.environ:
-    os.environ["NVIDIA_NIM_API_KEY"] = os.environ["NVIDIA_API_KEY"]
+# Quiet LiteLLM's own noise (opt out with LITLM_QUIET=0). The warning filters are
+# scoped to pydantic/LiteLLM serialization messages; nothing else is changed.
+if os.environ.get("LITLM_QUIET", "1") != "0":
+    warnings.filterwarnings("ignore", category=UserWarning, module="pydantic.*")
+    warnings.filterwarnings("ignore", message=".*Expected.*serialized value may not be as expected.*")
+    logging.getLogger("LiteLLM").setLevel(logging.ERROR)
+    litellm.suppress_debug_info = True
+
+
+_LOCAL = threading.local()
+
+
+def _run_sync(coro):
+    """Run `coro` to completion from synchronous code.
+
+    Without a running loop (scripts, CLI) this uses a persistent per-thread loop,
+    so LiteLLM's cached async clients stay valid across calls. Inside a running
+    loop (Jupyter), nest_asyncio is applied lazily; async callers should use
+    ``acomplete`` instead and never reach this path.
+    """
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+    if running is None:
+        loop = getattr(_LOCAL, "loop", None)
+        if loop is None or loop.is_closed():
+            loop = _LOCAL.loop = asyncio.new_event_loop()
+        return loop.run_until_complete(coro)
+    import nest_asyncio
+    nest_asyncio.apply(running)
+    return running.run_until_complete(coro)
 
 
 def extract_answer(s, tag="answer"):
@@ -95,7 +124,8 @@ def validate_args(kwargs):
     valid = set(sig.parameters.keys()) | {
         "caching", "num_retries", "max_tokens", "response_format", "extra_headers", 
         "base_url", "api_key", "api_base", "deployment_id", "timeout",
-        "cache_control", "extra_body", "reasoning", "reasoning_effort"
+        "cache_control", "extra_body", "reasoning", "reasoning_effort",
+        "tools", "tool_choice", "parallel_tool_calls",
     }
     for k in kwargs:
         if k not in valid:
@@ -176,11 +206,17 @@ def _quota_exhausted(exc):
     )
 
 
+def _nvidia_key():
+    return os.environ.get("NVIDIA_NIM_API_KEY") or os.environ.get("NVIDIA_API_KEY")
+
+
 def _with_provider_env(model, kwargs):
     call_kwargs = dict(kwargs)
     call_kwargs.pop("debug", None)
-    if model.startswith("nvidia_nim/"):
-        call_kwargs.setdefault("api_key", os.environ.get("NVIDIA_NIM_API_KEY") or os.environ.get("NVIDIA_API_KEY"))
+    if model.startswith("direct/nvidia_nim/"):
+        call_kwargs.setdefault("api_key", _nvidia_key())
+    elif model.startswith("nvidia_nim/"):
+        call_kwargs.setdefault("api_key", _nvidia_key())
         if "api_base" not in call_kwargs and "base_url" not in call_kwargs:
             call_kwargs["api_base"] = os.environ.get("NVIDIA_NIM_API_BASE")
         call_kwargs = _normalize_reasoning(call_kwargs)
@@ -326,7 +362,12 @@ class Text(str):
         obj._r, obj.call_id, obj.prompt = response, call_id, prompt
         obj.model_used = _MODEL_USED.get(id(response), _get(response, "model"))
         obj.cost = _response_cost(response)
-        msg = response.choices[0].message
+        choice = response.choices[0]
+        msg = choice.message
+        obj.raw = response
+        obj.message = msg
+        obj.tool_calls = list(getattr(msg, "tool_calls", None) or [])
+        obj.finish_reason = getattr(choice, "finish_reason", None)
         psf = getattr(msg, "provider_specific_fields", None) or {}
         rc = getattr(msg, "reasoning_content", None) or psf.get("reasoning_content")
         obj.reasoning = obj.reasoning_content = rc
@@ -381,6 +422,31 @@ class BatchResult(list):
         **overrides: Any,
     ) -> "BatchResult":
         """Retry failed positions in place, optionally overriding completion settings."""
+        plan = self._resume_plan(timeout, num_retries, max_concurrency, overrides)
+        if plan:
+            self._apply_resume(plan, complete(inputs=plan[1], **plan[2]))
+        return self
+
+    async def aresume(
+        self,
+        timeout: Optional[float] = None,
+        num_retries: Optional[int] = None,
+        max_concurrency: Optional[int] = None,
+        **overrides: Any,
+    ) -> "BatchResult":
+        """Async ``resume()`` for use inside a running event loop."""
+        plan = self._resume_plan(timeout, num_retries, max_concurrency, overrides)
+        if plan:
+            self._apply_resume(plan, await acomplete(inputs=plan[1], **plan[2]))
+        return self
+
+    def _apply_resume(self, plan, retried):
+        failed_indexes, _, _, options = plan
+        for index, result in zip(failed_indexes, retried):
+            self[index] = result
+        self._resume_options = options
+
+    def _resume_plan(self, timeout, num_retries, max_concurrency, overrides):
         if "inputs" in overrides:
             raise TypeError("resume() determines inputs from failed batch items")
 
@@ -389,7 +455,7 @@ class BatchResult(list):
             if getattr(item, "failed", False)
         ]
         if not failed_indexes:
-            return self
+            return None
 
         options = dict(self._resume_options)
         if timeout is not None:
@@ -409,11 +475,7 @@ class BatchResult(list):
                     failed_indexes[retry_index], result
                 )
             )
-        retried = complete(inputs=prompts, **call_options)
-        for index, result in zip(failed_indexes, retried):
-            self[index] = result
-        self._resume_options = options
-        return self
+        return failed_indexes, prompts, call_options, options
 
 def get_history(idx: int = -1): return _HISTORY[idx] if _HISTORY else None
 
@@ -464,7 +526,7 @@ def _representative_failure_lines(failures, max_types=3, max_chars=240):
         lines.append(f"  … and {remaining} other error type{'s' if remaining != 1 else ''}")
     return lines
 
-def complete(
+async def acomplete(
     inputs: Any,
     model: str = "openrouter/openai/gpt-4.1-nano",
     system: Optional[str] = None,
@@ -478,7 +540,7 @@ def complete(
     timeout: Optional[float] = 60,
     attempt_timeout: Optional[float] = None,
     debug: bool = False,
-    max_concurrency: Optional[int] = None,
+    max_concurrency: Optional[int] = 64,
     rpm: Optional[float] = None,
     reasoning_effort: Optional[str] = None,
     temperature: Optional[float] = None,
@@ -488,7 +550,7 @@ def complete(
     choices: Optional[Sequence[str]] = None,
     **kwargs: Any,
 ) -> Union[Text, Failure, BatchResult, Dict[str, Any], List[Any]]:
-    """Complete one prompt or an ordered batch with a synchronous, notebook-friendly API.
+    """Complete one prompt or an ordered batch (async; ``complete`` is the sync wrapper).
 
     Args:
         inputs: A string, message dict, conversation, or batch of those values.
@@ -506,7 +568,8 @@ def complete(
             provider attempt. Unlike `timeout`, this also covers providers
             that fail to honor LiteLLM's request timeout.
         debug: Print provider routing and fallback details.
-        max_concurrency: Maximum simultaneous batch requests; ``None`` is unbounded.
+        max_concurrency: Maximum simultaneous batch requests (default 64);
+            ``None`` or ``0`` is unbounded.
         rpm: Maximum request starts per minute; ``None`` disables throttling.
         reasoning_effort: Reasoning level such as ``"none"``, ``"low"``, or ``"high"``.
         temperature: Sampling temperature forwarded to the provider.
@@ -524,7 +587,9 @@ def complete(
         **kwargs: Additional LiteLLM/provider parameters.
 
     Returns:
-        A Text-like scalar for one prompt, or a list-compatible BatchResult. Call
+        A Text-like scalar for one prompt, or a list-compatible BatchResult.
+        ``Text`` also exposes ``.message``, ``.tool_calls``, ``.finish_reason``
+        and ``.raw`` (the LiteLLM response); pass ``tools=`` as usual. Call
         ``batch.resume(timeout=...)`` to retry only failed batch positions in place,
         and ``batch.summary()`` for a one-line status. In a batch, replies that
         fail ``json``/``choices`` parsing are ``Failure`` items; a scalar raises.
@@ -606,7 +671,7 @@ def complete(
         async def _throttle():
             if not _interval: return
             async with _rl_lock:
-                loop = asyncio.get_event_loop(); now = loop.time()
+                now = asyncio.get_running_loop().time()
                 wait = _next[0] - now
                 if wait > 0: await asyncio.sleep(wait)
                 _next[0] = max(now, _next[0]) + _interval
@@ -741,7 +806,7 @@ def complete(
         return await asyncio.gather(*tasks)
 
     # Execute
-    raw = asyncio.get_event_loop().run_until_complete(_runner())
+    raw = await _runner()
     out = [
         r if isinstance(r, (Text, Failure)) else _wrap_result(index, r)
         for index, r in enumerate(raw)
@@ -786,6 +851,39 @@ def complete(
         res = res[0]
     _HISTORY.append(res)
     return res
+
+def complete(
+    inputs: Any,
+    model: str = "openrouter/openai/gpt-4.1-nano",
+    system: Optional[str] = None,
+    json: bool = False,
+    show_progress: bool = True,
+    caching: bool = False,
+    prompt_cache: Union[bool, str, Dict[str, Any]] = False,
+    cache_control: Optional[Dict[str, Any]] = None,
+    num_retries: int = 3,
+    max_tokens: int = 1024,
+    timeout: Optional[float] = 60,
+    attempt_timeout: Optional[float] = None,
+    debug: bool = False,
+    max_concurrency: Optional[int] = 64,
+    rpm: Optional[float] = None,
+    reasoning_effort: Optional[str] = None,
+    temperature: Optional[float] = None,
+    on_result: Optional[Callable[[int, Union[Text, Failure]], None]] = None,
+    fallbacks: Optional[Sequence[str]] = None,
+    template: Optional[str] = None,
+    choices: Optional[Sequence[str]] = None,
+    **kwargs: Any,
+) -> Union[Text, Failure, BatchResult, Dict[str, Any], List[Any]]:
+    args = dict(locals())
+    extra = args.pop("kwargs")
+    return _run_sync(acomplete(**args, **extra))
+
+
+complete.__doc__ = acomplete.__doc__.replace(
+    "(async; ``complete`` is the sync wrapper)",
+    "synchronously (``acomplete`` is the async form)")
 
 # Alias for explicit OpenRouter intent (optional, since complete handles it now)
 or_complete = complete
