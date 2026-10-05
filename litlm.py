@@ -361,6 +361,7 @@ class Text(str):
         obj = super().__new__(cls, content)
         obj._r, obj.call_id, obj.prompt = response, call_id, prompt
         obj.model_used = _MODEL_USED.get(id(response), _get(response, "model"))
+        obj.key_env = _get(response, "_litlm_key_env")
         obj.cost = _response_cost(response)
         choice = response.choices[0]
         msg = choice.message
@@ -526,6 +527,37 @@ def _representative_failure_lines(failures, max_types=3, max_chars=240):
         lines.append(f"  … and {remaining} other error type{'s' if remaining != 1 else ''}")
     return lines
 
+class _KeyPool:
+    """Reserve the earliest per-key request slot without blocking other keys."""
+    def __init__(self, names, rpm):
+        self.keys = list(dict.fromkeys(os.environ[name] for name in names))
+        self.names = [next(name for name in names if os.environ[name] == key) for key in self.keys]
+        self.interval = 60.0 / rpm if rpm else 0.0
+        self.next_start = [0.0] * len(self.keys)
+        self.used = [0] * len(self.keys)
+        self.disabled = set()
+        self.lock = asyncio.Lock()
+        self.counter = 0
+
+    async def acquire(self):
+        async with self.lock:
+            available = [i for i in range(len(self.keys)) if i not in self.disabled]
+            if not available:
+                return None, None
+            i = min(available, key=lambda i: (self.next_start[i], self.used[i]))
+            now = asyncio.get_running_loop().time()
+            slot = max(now, self.next_start[i])
+            self.next_start[i] = slot + self.interval
+            self.counter += 1
+            self.used[i] = self.counter
+        if slot > now:
+            await asyncio.sleep(slot - now)
+        # Another in-flight request may have discovered an invalid key while we waited.
+        if i in self.disabled:
+            return await self.acquire()
+        return i, self.keys[i]
+
+
 async def acomplete(
     inputs: Any,
     model: str = "openrouter/openai/gpt-4.1-nano",
@@ -542,6 +574,9 @@ async def acomplete(
     debug: bool = False,
     max_concurrency: Optional[int] = 64,
     rpm: Optional[float] = None,
+    api_key_envs: Optional[Sequence[str]] = None,
+    per_key_rpm: Optional[float] = None,
+    progress_interval: Optional[float] = None,
     reasoning_effort: Optional[str] = None,
     temperature: Optional[float] = None,
     on_result: Optional[Callable[[int, Union[Text, Failure]], None]] = None,
@@ -571,6 +606,12 @@ async def acomplete(
         max_concurrency: Maximum simultaneous batch requests (default 64);
             ``None`` or ``0`` is unbounded.
         rpm: Maximum request starts per minute; ``None`` disables throttling.
+        api_key_envs: Environment variable names of interchangeable keys for
+            one exact provider route. Values are never stored in checkpoints.
+        per_key_rpm: Request starts per minute for each key in the pool.
+            Set num_retries=0 to have every network attempt paced by litlm.
+        progress_interval: Seconds between compact stderr progress/ETA lines,
+            useful for non-terminal batch jobs; None disables these lines.
         reasoning_effort: Reasoning level such as ``"none"``, ``"low"``, or ``"high"``.
         temperature: Sampling temperature forwarded to the provider.
         on_result: Optional callback invoked as each batch item settles. It
@@ -600,6 +641,18 @@ async def acomplete(
         if isinstance(choices, str) or not choices:
             raise ValueError("choices must be a non-empty sequence of labels")
         choices = list(choices)
+    if api_key_envs is not None:
+        if isinstance(api_key_envs, str) or not api_key_envs:
+            raise ValueError("api_key_envs must be a non-empty sequence of environment names")
+        api_key_envs = list(dict.fromkeys(api_key_envs))
+        if any(not os.environ.get(name) for name in api_key_envs):
+            raise ValueError("every api_key_envs variable must be set")
+        if "api_key" in kwargs:
+            raise ValueError("api_key and api_key_envs cannot be combined")
+    if per_key_rpm is not None and (per_key_rpm <= 0 or api_key_envs is None):
+        raise ValueError("per_key_rpm requires api_key_envs and must be positive")
+    if progress_interval is not None and progress_interval <= 0:
+        raise ValueError("progress_interval must be positive")
     if template is not None:
         inputs = _apply_template(inputs, template)
     debug = bool(debug or kwargs.pop("debug", False))
@@ -663,6 +716,9 @@ async def acomplete(
         models = routes(model, fallbacks)
         if debug:
             print(f"litlm fallback models: {models}")
+        if api_key_envs and (len(models) != 1 or not model.startswith(("albert/", "openrouter/", "nvidia_nim/", "direct/"))):
+            raise ValueError("api_key_envs requires one exact provider route")
+        pool = _KeyPool(api_key_envs, per_key_rpm) if api_key_envs else None
         disabled_routes = set()
         cc = _cache_control(prompt_cache, cache_control)
         # rpm throttle: pace request STARTS to stay under `rpm` (parallel underneath, up to max_concurrency).
@@ -687,6 +743,14 @@ async def acomplete(
                 call_kwargs = _with_provider_env(m, kwargs)
                 if cc and m.startswith("openrouter/"): call_kwargs["cache_control"] = cc
 
+                key_index = None
+                if pool:
+                    key_index, key = await pool.acquire()
+                    if key_index is None:
+                        last = RuntimeError("all configured API keys are disabled for this batch")
+                        break
+                    call_kwargs["api_key"] = key
+
                 # Retry loop for local parameter dropping (0 network requests wasted)
                 while True:
                     try:
@@ -703,6 +767,9 @@ async def acomplete(
                         )
                         try: res._litlm_model_used = m
                         except Exception: pass
+                        if pool:
+                            try: res._litlm_key_env = pool.names[key_index]
+                            except Exception: pass
                         try: res._litlm_latency_s = time.perf_counter() - started
                         except Exception: pass
                         _record_cost(res, m)
@@ -743,6 +810,12 @@ async def acomplete(
                             continue
                         if debug:
                             print(f"litlm failed with model {m}: {type(e).__name__}: {e}")
+                        if pool and (_quota_exhausted(e) or isinstance(e, litellm.AuthenticationError)):
+                            pool.disabled.add(key_index)
+                            key_index, key = await pool.acquire()
+                            if key_index is not None:
+                                call_kwargs["api_key"] = key
+                                continue
                         if _quota_exhausted(e):
                             disabled_routes.add(m)
                             if debug:
@@ -761,7 +834,7 @@ async def acomplete(
             tasks = [_bounded(r) for r in reqs]
         else:
             tasks = [_one(r) for r in reqs]
-        if (show_progress or on_result is not None) and len(reqs) > 1:
+        if (show_progress or on_result is not None or progress_interval) and len(reqs) > 1:
             results = [None] * len(tasks)
             batch_cost = 0.0
             async def _settled(i, task):
@@ -773,17 +846,25 @@ async def acomplete(
                 # completion order rather than as_completed() iteration order.
                 return i, _wrap_result(i, response)
 
-            pending = [_settled(i, task) for i, task in enumerate(tasks)]
+            pending = [asyncio.create_task(_settled(i, task)) for i, task in enumerate(tasks)]
             settled = asyncio.as_completed(pending)
             bar = tq(settled, total=len(tasks), desc="Completing") if show_progress else settled
             failed = 0
             completed = 0
+            progress_started = last_progress = time.monotonic()
             errors = []
             try:
                 for future in bar:
                     i, result = await future
                     results[i] = result
                     completed += 1
+                    now = time.monotonic()
+                    if progress_interval and now - last_progress >= progress_interval:
+                        elapsed = now - progress_started
+                        eta = int((len(tasks) - completed) * elapsed / completed)
+                        print(f"litlm: {completed}/{len(tasks)} settled, "
+                              f"ETA {eta // 60}m {eta % 60}s", file=sys.stderr)
+                        last_progress = now
                     if result.failed:
                         failed += 1
                         errors.append(result.error)
@@ -839,6 +920,9 @@ async def acomplete(
             "debug": debug,
             "max_concurrency": max_concurrency,
             "rpm": rpm,
+            "api_key_envs": api_key_envs,
+            "per_key_rpm": per_key_rpm,
+            "progress_interval": progress_interval,
             "reasoning_effort": reasoning_effort,
             "temperature": temperature,
             "on_result": on_result,
@@ -868,6 +952,9 @@ def complete(
     debug: bool = False,
     max_concurrency: Optional[int] = 64,
     rpm: Optional[float] = None,
+    api_key_envs: Optional[Sequence[str]] = None,
+    per_key_rpm: Optional[float] = None,
+    progress_interval: Optional[float] = None,
     reasoning_effort: Optional[str] = None,
     temperature: Optional[float] = None,
     on_result: Optional[Callable[[int, Union[Text, Failure]], None]] = None,

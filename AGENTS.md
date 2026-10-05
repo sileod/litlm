@@ -39,6 +39,9 @@ summary line.
 - Keep `max_tokens` small for labels and short answers. For throughput, set
   `--max-concurrency` (default 64, 0 means unbounded) and `--rpm` rather than
   writing your own loops.
+- Multiple keys for one exact route: `--api-key-envs KEY,KEY_2`
+  with `--per-key-rpm 40 --num-retries 0`. Python takes `api_key_envs=[...]`
+  and `per_key_rpm=40`. Quotas are paced per call, not across processes.
 
 ## Contracts
 

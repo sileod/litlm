@@ -87,6 +87,38 @@ With `--out`, stdout carries only the summary line. Each record includes its
 line is recomputed instead of silently reused. The exit status is nonzero while
 any item is still failed or missing.
 
+### Multiple keys
+
+For large jobs on one provider, name the environment variables holding its keys:
+
+```bash
+litlm -i rows.jsonl -t 'Classify: {text}' --choices yes,no \
+  -m albert/deepseek-v4-flash-0731 \
+  --api-key-envs KEY,KEY_2,KEY_3,KEY_4 \
+  --per-key-rpm 40 --max-concurrency 16 --num-retries 0 -o labels.jsonl
+```
+
+The pool balances request starts across keys and paces each key independently.
+`--rpm` remains an optional global limit. Quota-exhausted or invalid keys are
+disabled for the batch, and another key on the same provider is tried; ordinary
+request failures remain retryable through the checkpoint. The pool requires an
+exact provider route and every named variable to be set. Duplicate key values
+share one slot. Limits apply to each `complete()` call; separate processes do
+not coordinate their quotas. Use `--num-retries 0` for pacing every attempt;
+LiteLLM's internal retries otherwise happen inside a reserved request slot.
+
+In Python, use `complete(..., api_key_envs=[...], per_key_rpm=40)`.
+Keys are read from the environment at runtime; checkpoint keys and resume
+options contain the environment variable names, not their values. Changing the
+model or generation settings invalidates completed CLI records.
+CLI batches also report progress and estimated remaining time on stderr every
+30 seconds (`--progress-interval`), including background jobs. The ETA uses
+observed completions and includes pacing; early estimates can fluctuate.
+Pooled records include `key_env` and `latency_s` so throughput and failures can
+be compared by key without exposing credentials.
+
+The reusable coding-agent skill is in [skills/litlm/SKILL.md](skills/litlm/SKILL.md).
+
 ## Why litlm
 
 - A string in, a string-like result out.

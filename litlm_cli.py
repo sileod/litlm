@@ -70,6 +70,9 @@ def _record(result):
         data["data"] = _jsonable(result)
     else:
         attrs = getattr(result, "__dict__", {})
+        if attrs.get("key_env"):
+            data["key_env"] = attrs['key_env']
+            data["latency_s"] = attrs.get('latency_s')
         if "data" in attrs:
             # Text settled with json=True (seen by on_result before parsing is unwrapped).
             data["data"] = _jsonable(attrs["data"])
@@ -169,6 +172,11 @@ def _parser():
     parser.add_argument("--attempt-timeout", type=float)
     parser.add_argument("--max-concurrency", type=int, default=64, help="0 means unbounded")
     parser.add_argument("--rpm", type=float)
+    parser.add_argument("--api-key-envs", type=lambda s: [name.strip() for name in s.split(",") if name.strip()],
+                        help="comma-separated environment names of interchangeable keys; requires an exact route")
+    parser.add_argument("--per-key-rpm", type=float, help="maximum request starts per minute for each pooled key")
+    parser.add_argument("--progress-interval", type=float, default=30,
+                        help="seconds between stderr progress/ETA updates (default 30)")
     parser.add_argument("--reasoning-effort")
     parser.add_argument("--temperature", type=float)
     parser.add_argument("--fallback", action="append", dest="fallbacks")
@@ -207,7 +215,9 @@ def _print(results, output, batch, fields=None):
 
 
 def _key(value, args):
-    spec = [value, args.template, args.choices, args.system, args.json]
+    spec = [value, args.template, args.choices, args.system, args.json,
+            args.model, args.max_tokens, args.temperature, args.reasoning_effort, args.fallbacks,
+            [param for param in args.param if param.split('=', 1)[0] not in {'api_key', 'api_key_envs'}]]
     blob = json.dumps(spec, sort_keys=True, ensure_ascii=False, default=str)
     return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:12]
 
@@ -315,6 +325,9 @@ def main(argv=None):
         debug=args.debug,
         max_concurrency=args.max_concurrency,
         rpm=args.rpm,
+        api_key_envs=args.api_key_envs,
+        per_key_rpm=args.per_key_rpm,
+        progress_interval=args.progress_interval,
         reasoning_effort=args.reasoning_effort,
         temperature=args.temperature,
         fallbacks=args.fallbacks,
