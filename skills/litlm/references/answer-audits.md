@@ -22,6 +22,20 @@ success and coverage are separate checks. Save each response immediately rather
 than waiting for a large chunk. Replay valid saved responses before requesting
 missing annotations again.
 
+Compare batch sizes on the same reviewed examples with identical prompts, reasoning
+settings and schemas. Measure false exclusions, recovered known defects, abstentions,
+validated coverage and throughput including timeout attempts. Missing batch responses
+are coverage failures, not evidence of semantic quality. Use the prompt's exact task
+criterion; a weak supporting detector or model agreement alone cannot adjudicate labels.
+Ask for gold assessment, remaining uncertainty and an explicit uncertain verdict. Optional
+high/medium/low exclusion confidence is uncalibrated and must not authorize removal.
+
+For heterogeneous long runs, schedule one pending example per task per round. Track
+per-task and overall coverage and refine ETA from steady throughput. Separate hard
+answer checks from subjective preferences or annotator-share targets. Replay saved raw
+responses through the verdict-writing callback too: a crash can occur between the raw
+checkpoint and the accepted annotation. Make this merge idempotent by stable ID.
+
 Keep extraction and re-solving separate. A parsing task should recover the source
 answer; an answer audit evaluates whether it is correct. Retain the original
 question, answer, split, and stable ID in derived data.

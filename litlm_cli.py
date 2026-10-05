@@ -171,6 +171,8 @@ def _parser():
     parser.add_argument("--timeout", type=float, default=60)
     parser.add_argument("--attempt-timeout", type=float)
     parser.add_argument("--max-concurrency", type=int, default=64, help="0 means unbounded")
+    parser.add_argument("--adaptive-concurrency", action="store_true",
+                        help="adapt concurrency below --max-concurrency; keep configured RPM ceilings")
     parser.add_argument("--rpm", type=float)
     parser.add_argument("--api-key-envs", type=lambda s: [name.strip() for name in s.split(",") if name.strip()],
                         help="comma-separated environment names of interchangeable keys; requires an exact route")
@@ -324,6 +326,7 @@ def main(argv=None):
         attempt_timeout=args.attempt_timeout,
         debug=args.debug,
         max_concurrency=args.max_concurrency,
+        adaptive_concurrency=args.adaptive_concurrency,
         rpm=args.rpm,
         api_key_envs=args.api_key_envs,
         per_key_rpm=args.per_key_rpm,

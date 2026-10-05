@@ -413,6 +413,9 @@ class BatchResult(list):
         if failures:
             parts.append(f"{len(failures)} failed: " + _compact_error_breakdown(
                 [f.error for f in failures], max_types=max_types, max_chars=160))
+        tuning = getattr(self, "tuning", None)
+        if tuning:
+            parts.append(f"concurrency={tuning['concurrency']}/{tuning['ceiling']}")
         return " | ".join(parts)
 
     def resume(
@@ -446,6 +449,10 @@ class BatchResult(list):
         for index, result in zip(failed_indexes, retried):
             self[index] = result
         self._resume_options = options
+        if hasattr(retried, "tuning"):
+            self.tuning = retried.tuning
+        elif hasattr(self, "tuning"):
+            del self.tuning
 
     def _resume_plan(self, timeout, num_retries, max_concurrency, overrides):
         if "inputs" in overrides:
@@ -527,6 +534,57 @@ def _representative_failure_lines(failures, max_types=3, max_chars=240):
         lines.append(f"  … and {remaining} other error type{'s' if remaining != 1 else ''}")
     return lines
 
+class _AdaptiveConcurrency:
+    """Bounded slow start and congestion backoff; request pacing stays separate."""
+    def __init__(self, ceiling, initial=8):
+        self.ceiling = ceiling
+        self.limit = min(ceiling, initial)
+        self.active = self.samples = self.errors = self.generation = 0
+        self.increases = self.decreases = 0
+        self.condition = asyncio.Condition()
+
+    async def acquire(self):
+        async with self.condition:
+            await self.condition.wait_for(lambda: self.active < self.limit)
+            self.active += 1
+
+    async def release(self):
+        async with self.condition:
+            self.active -= 1
+            self.condition.notify_all()
+
+    def observe(self, error, generation):
+        # Old in-flight failures must not repeatedly halve a reduced limit.
+        if generation != self.generation:
+            return
+        status = getattr(error, 'status_code', None)
+        limited = isinstance(error, litellm.RateLimitError) or status == 429
+        congested = (limited or isinstance(error, (TimeoutError, litellm.Timeout))
+                     or isinstance(status, int) and 500 <= status < 600)
+        if error is not None and (not congested or _quota_exhausted(error)):
+            return
+        self.samples += 1
+        self.errors += int(error is not None)
+        window = max(8, min(32, self.limit))
+        if limited or (self.samples >= window and self.errors >= 2
+                       and self.errors / self.samples >= .1):
+            new = max(1, self.limit // 2)
+            if new != self.limit:
+                self.limit = new
+                self.decreases += 1
+            self.generation += 1
+            self.samples = self.errors = 0
+        elif self.samples >= window:
+            if self.errors / self.samples <= .05 and self.limit < self.ceiling:
+                self.limit = min(self.ceiling, self.limit * 2)
+                self.increases += 1
+            self.samples = self.errors = 0
+
+    def snapshot(self):
+        return dict(concurrency=self.limit, ceiling=self.ceiling,
+                    increases=self.increases, decreases=self.decreases)
+
+
 class _KeyPool:
     """Reserve the earliest per-key request slot without blocking other keys."""
     def __init__(self, names, rpm):
@@ -583,6 +641,7 @@ async def acomplete(
     fallbacks: Optional[Sequence[str]] = None,
     template: Optional[str] = None,
     choices: Optional[Sequence[str]] = None,
+    adaptive_concurrency: bool = False,
     **kwargs: Any,
 ) -> Union[Text, Failure, BatchResult, Dict[str, Any], List[Any]]:
     """Complete one prompt or an ordered batch (async; ``complete`` is the sync wrapper).
@@ -605,6 +664,9 @@ async def acomplete(
         debug: Print provider routing and fallback details.
         max_concurrency: Maximum simultaneous batch requests (default 64);
             ``None`` or ``0`` is unbounded.
+        adaptive_concurrency: Opt-in slow start and congestion backoff below
+            max_concurrency (a positive ceiling is required). RPM limits stay
+            fixed. Does not change prompts, batch sizes, retries or models.
         rpm: Maximum request starts per minute; ``None`` disables throttling.
         api_key_envs: Environment variable names of interchangeable keys for
             one exact provider route. Values are never stored in checkpoints.
@@ -637,6 +699,8 @@ async def acomplete(
     """
     if json and choices is not None:
         raise ValueError("json and choices cannot be combined")
+    if adaptive_concurrency and (type(max_concurrency) is not int or max_concurrency <= 0):
+        raise ValueError("adaptive_concurrency requires a positive integer max_concurrency ceiling")
     if choices is not None:
         if isinstance(choices, str) or not choices:
             raise ValueError("choices must be a non-empty sequence of labels")
@@ -712,6 +776,7 @@ async def acomplete(
         return result
 
     # Async Runner
+    adaptive = _AdaptiveConcurrency(max_concurrency) if adaptive_concurrency else None
     async def _runner():
         models = routes(model, fallbacks)
         if debug:
@@ -754,6 +819,7 @@ async def acomplete(
                 # Retry loop for local parameter dropping (0 network requests wasted)
                 while True:
                     try:
+                        generation = adaptive.generation if adaptive else None
                         if debug:
                             print(f"litlm trying model: {m}")
                         request = acompletion(
@@ -773,6 +839,7 @@ async def acomplete(
                         try: res._litlm_latency_s = time.perf_counter() - started
                         except Exception: pass
                         _record_cost(res, m)
+                        if adaptive: adaptive.observe(None, generation)
                         if debug:
                             print(f"litlm succeeded with model: {m}")
                         return res
@@ -792,12 +859,14 @@ async def acomplete(
                             print(f"litlm failed with model {m}: {type(e).__name__}: {e}")
                         last = e
                         break
-                    except TimeoutError:
+                    except TimeoutError as e:
+                        if adaptive: adaptive.observe(e, generation)
                         last = TimeoutError(f"litlm timed out after {timeout}s while calling {m}")
                         if debug:
                             print(f"litlm failed with model {m}: TimeoutError: {last}")
                         break
                     except Exception as e:
+                        if adaptive: adaptive.observe(e, generation)
                         if _mentions_unsupported_reasoning_effort(e) and _drop_reasoning_effort(call_kwargs):
                             # Some providers reject extra_body.reasoning_effort at request time.
                             if debug:
@@ -827,7 +896,15 @@ async def acomplete(
             try: last._litlm_latency_s = time.perf_counter() - started
             except Exception: pass
             raise last from None
-        if max_concurrency and max_concurrency > 0:
+        if adaptive:
+            async def _bounded(r):
+                await adaptive.acquire()
+                try:
+                    return await _one(r)
+                finally:
+                    await adaptive.release()
+            tasks = [_bounded(r) for r in reqs]
+        elif max_concurrency and max_concurrency > 0:
             _sem = asyncio.Semaphore(int(max_concurrency))
             async def _bounded(r):
                 async with _sem: return await _one(r)
@@ -862,8 +939,9 @@ async def acomplete(
                     if progress_interval and now - last_progress >= progress_interval:
                         elapsed = now - progress_started
                         eta = int((len(tasks) - completed) * elapsed / completed)
+                        tuning = f", concurrency {adaptive.limit}/{adaptive.ceiling}" if adaptive else ""
                         print(f"litlm: {completed}/{len(tasks)} settled, "
-                              f"ETA {eta // 60}m {eta % 60}s", file=sys.stderr)
+                              f"ETA {eta // 60}m {eta % 60}s{tuning}", file=sys.stderr)
                         last_progress = now
                     if result.failed:
                         failed += 1
@@ -928,9 +1006,12 @@ async def acomplete(
             "on_result": on_result,
             "fallbacks": fallbacks,
             "choices": choices,
+            "adaptive_concurrency": adaptive_concurrency,
             **kwargs,
         }
         res = BatchResult(res, resume_options=resume_options)
+        if adaptive:
+            res.tuning = adaptive.snapshot()
     else:
         res = res[0]
     _HISTORY.append(res)
@@ -961,6 +1042,7 @@ def complete(
     fallbacks: Optional[Sequence[str]] = None,
     template: Optional[str] = None,
     choices: Optional[Sequence[str]] = None,
+    adaptive_concurrency: bool = False,
     **kwargs: Any,
 ) -> Union[Text, Failure, BatchResult, Dict[str, Any], List[Any]]:
     args = dict(locals())

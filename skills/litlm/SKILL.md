@@ -45,6 +45,12 @@ limit, `--per-key-rpm` is per key. Scheduling is local to a call: simultaneous j
 with the same keys share provider quotas but do not coordinate their limits.
 Request pacing does not enforce input-token quotas. Budget the full rendered
 prompt, including options and references; large label menus can dominate its size.
+For long batches with uncertain congestion, opt in to `--adaptive-concurrency`
+with a positive `--max-concurrency` ceiling (Python: `adaptive_concurrency=True`).
+It ramps concurrency and backs off on observed congestion; RPM ceilings remain
+fixed. It does not optimize examples per request or change generation settings.
+Inspect progress concurrency and Python `batch.tuning`; this per-call heuristic
+does not guarantee optimal throughput or coordinate quotas across jobs.
 Use `--num-retries 0` when each network attempt must be scheduled by the pool.
 Quota-exhausted and invalid keys are disabled for the batch; request failures
 remain in the checkpoint. Keys belong in the environment, outside tracked files.

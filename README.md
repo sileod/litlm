@@ -87,6 +87,27 @@ With `--out`, stdout carries only the summary line. Each record includes its
 line is recomputed instead of silently reused. The exit status is nonzero while
 any item is still failed or missing.
 
+### Adaptive concurrency
+
+For long jobs with variable latency or congestion, opt in with
+`--adaptive-concurrency --max-concurrency 128` (Python:
+`adaptive_concurrency=True, max_concurrency=128`). It starts at up to eight
+concurrent requests, grows after low-error completion windows, and halves
+concurrency on a 429 or repeated timeout/server errors. Already running requests
+finish normally; failures from that previous wave do not trigger repeated backoff.
+Progress lines show the current concurrency and ceiling. Python batch results
+also expose `batch.tuning` and include the final concurrency in `batch.summary()`.
+
+The positive `max_concurrency` value is a hard ceiling; configured `rpm` and
+`per_key_rpm` limits remain unchanged. Prompts, models, output limits and examples
+per request remain unchanged. Use `num_retries=0` to expose each provider attempt
+to the scheduler; hidden provider retries can mask congestion. Authentication,
+exhausted quota and malformed-input errors do not drive concurrency tuning.
+This is a per-call heuristic, not a throughput-optimality guarantee or a token
+quota controller. It is most useful for long batches; small jobs may finish before
+it learns. Separate calls/processes still do not coordinate quotas. Adaptive mode
+is off by default, and changing it does not invalidate CLI checkpoints.
+
 ### Multiple keys
 
 For large jobs on one provider, name the environment variables holding its keys:
