@@ -16,6 +16,11 @@ the answer index is in range, and the verdict is consistent with the answer.
 Valid JSON and a successful API call do not establish these invariants. Reject
 partial batches and mark their checkpoint records failed so reruns request them
 again. Preserve the original response for diagnosing semantic validation failures.
+Prefer structured JSON with an explicit list of required example indices. A
+successful response may cover only the first example or omit later ones; API
+success and coverage are separate checks. Save each response immediately rather
+than waiting for a large chunk. Replay valid saved responses before requesting
+missing annotations again.
 
 Keep extraction and re-solving separate. A parsing task should recover the source
 answer; an answer audit evaluates whether it is correct. Retain the original

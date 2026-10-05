@@ -43,6 +43,8 @@ use an exact route so credentials stay on the intended provider. All named key
 variables must be set; duplicate values share one rate slot. `--rpm` is a global
 limit, `--per-key-rpm` is per key. Scheduling is local to a call: simultaneous jobs
 with the same keys share provider quotas but do not coordinate their limits.
+Request pacing does not enforce input-token quotas. Budget the full rendered
+prompt, including options and references; large label menus can dominate its size.
 Use `--num-retries 0` when each network attempt must be scheduled by the pool.
 Quota-exhausted and invalid keys are disabled for the batch; request failures
 remain in the checkpoint. Keys belong in the environment, outside tracked files.
