@@ -463,3 +463,5 @@ The CLI supports `--decisions questions.json` for shared questions, or bare `--d
 `ensemble()` / `aensemble()` average matching distributions with optional positive `weights`, retaining all member answers, usage and model versions. They return a result for a scalar or a list of results for a batch. Model batches run sequentially through the existing scheduler. A failed member makes that row's ensemble incomplete rather than averaging the remaining models; member results remain inspectable. Averages are convenience scores, not a guarantee of calibration or independent evidence. Rerun with caching to reuse successful calls.
 
 Malformed native Decisions answers remain failures; checkpoint records retain the response body in `raw_response` for diagnosis, separate from accepted `data` and the success cache. Probability-sum errors identify the question and observed total.
+
+For native probability vectors quantized to hundredths, sum validation allows the rounding bound (half a hundredth per alternative, capped at 0.02). Higher-precision vectors retain the 0.001 tolerance. Returned probabilities are never normalized or rewritten.

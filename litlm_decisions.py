@@ -26,7 +26,7 @@ def validate_questions(questions):
             raise ValueError('score needs an ordered criteria list')
 
 
-def validate_answers(data, questions):
+def validate_answers(data, questions, *, sum_tolerance=None):
     answers=data.get('answers')
     if not isinstance(answers,dict) or set(answers)!=set(questions):
         raise ValueError('Decisions response has missing or unexpected questions')
@@ -43,7 +43,10 @@ def validate_answers(data, questions):
                 raise ValueError('Decision score legend mismatch')
         if any(not isinstance(v,(int,float)) or not math.isfinite(v) or not 0<=v<=1 for v in values):
             raise ValueError('Invalid decision probabilities')
-        if question['type']!='noul' and abs(sum(values)-1)>0.001:
+        # Native routes may quantize probabilities to hundredths; retain their values.
+        rounded=all(abs(v-round(v,2))<1e-12 for v in values)
+        tolerance=sum_tolerance if sum_tolerance is not None else min(0.02,0.005*len(values)) if rounded else 0.001
+        if question['type']!='noul' and abs(sum(values)-1)>tolerance+1e-12:
             raise ValueError(f'Decision {name!r} probabilities sum to {sum(values):.8g}, expected one')
 
 
@@ -131,7 +134,8 @@ async def aensemble(inputs, models, decisions, weights=None, **kwargs):
             data=dict(model='ensemble',answers=answers,members=[v.data for v in values],agreement=agreement,
                       aggregation=dict(method='weighted_mean',models=list(models),weights=weights),
                       usage=dict(cost=sum(float(v.cost or 0) for v in values)))
-            validate_answers(data,questions)
+            # A weighted mean preserves the bounded rounding errors of validated members.
+            validate_answers(data,questions,sum_tolerance=0.02)
             response=SimpleNamespace(model='ensemble',usage=data['usage'],
                 choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(data)),finish_reason='stop')])
             result=Text(json.dumps(data),response,None,state);result.data=data

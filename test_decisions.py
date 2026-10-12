@@ -161,3 +161,28 @@ def test_invalid_native_answer_is_preserved_separately_from_accepted_cache(tmp_p
     assert '1.5' in record['error']['message'] and 'eligible' in record['error']['message']
     assert 'private-test-key' not in json.dumps(record)
     assert not list((tmp_path/'decisions').glob('*.json'))
+
+
+def test_native_rounding_is_bounded_and_does_not_rewrite_probabilities():
+    data={'answers':{'eligible':{'type':'choice','probabilities':{'yes':0.49,'no':0.3,'unknown':0.2}}}}
+    original=json.dumps(data)
+    litlm_decisions.validate_answers(data,QUESTIONS)
+    assert json.dumps(data)==original
+    data['answers']['eligible']['probabilities']['yes']=0.48
+    with pytest.raises(ValueError):litlm_decisions.validate_answers(data,QUESTIONS)
+    data['answers']['eligible']['probabilities']={'yes':0.49123,'no':0.3,'unknown':0.2}
+    with pytest.raises(ValueError):litlm_decisions.validate_answers(data,QUESTIONS)
+
+
+def test_ensemble_preserves_mean_of_rounded_native_probabilities(monkeypatch):
+    def handle(request):
+        data=json.loads(response(request).content)
+        model=json.loads(request.content)['model']
+        data['answers']['eligible']['probabilities']={'yes':0.49 if model=='one' else 0.5,'no':0.3,'unknown':0.2}
+        return httpx.Response(200,json=data)
+    transport(monkeypatch,handle)
+    result=litlm.ensemble('source',['openrouter/one','openrouter/two'],decisions=QUESTIONS,show_progress=False)
+    assert not result.failed
+    probabilities=result.data['answers']['eligible']['probabilities']
+    assert probabilities['yes']==pytest.approx(0.495)
+    assert sum(probabilities.values())==pytest.approx(0.995)
