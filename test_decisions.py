@@ -149,3 +149,15 @@ def test_decisions_cli_accepts_packed_bundles(tmp_path,monkeypatch):
     out=tmp_path/'out.jsonl'
     assert litlm_cli.main(['-i',str(path),'--decisions','-m','openrouter/test','-o',str(out)])==0
     assert calls==[{'model':'test','state':{'source':'one'},'questions':QUESTIONS}]
+
+
+def test_invalid_native_answer_is_preserved_separately_from_accepted_cache(tmp_path,monkeypatch):
+    bad={'model':'dated-model','usage':{'cost':0.001},'answers':{'eligible':{'type':'choice','probabilities':{'yes':0.5,'no':0.5,'unknown':0.5}}}}
+    transport(monkeypatch,lambda request:httpx.Response(200,json=bad))
+    monkeypatch.setattr(litlm,'CACHE_DIR',tmp_path)
+    result=litlm.complete(['source','another source'],decisions=QUESTIONS,model='openrouter/test',caching=True,show_progress=False)[0]
+    record=litlm_cli._record(result)
+    assert record['failed'] and record['raw_response']==bad
+    assert '1.5' in record['error']['message'] and 'eligible' in record['error']['message']
+    assert 'private-test-key' not in json.dumps(record)
+    assert not list((tmp_path/'decisions').glob('*.json'))

@@ -62,6 +62,8 @@ def _record(result):
     }
     if failed:
         error = getattr(result, "error", None)
+        if hasattr(error, "raw_response"):
+            data["raw_response"] = _jsonable(error.raw_response)
         data["error"] = {
             "type": type(error).__name__ if error is not None else None,
             "message": str(error) if error is not None else None,

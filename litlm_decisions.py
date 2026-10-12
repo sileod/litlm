@@ -43,7 +43,8 @@ def validate_answers(data, questions):
                 raise ValueError('Decision score legend mismatch')
         if any(not isinstance(v,(int,float)) or not math.isfinite(v) or not 0<=v<=1 for v in values):
             raise ValueError('Invalid decision probabilities')
-        if question['type']!='noul' and abs(sum(values)-1)>0.001:raise ValueError('Decision probabilities do not sum to one')
+        if question['type']!='noul' and abs(sum(values)-1)>0.001:
+            raise ValueError(f'Decision {name!r} probabilities sum to {sum(values):.8g}, expected one')
 
 
 async def adecision_completion(*, model, state, questions, api_key=None, timeout=60, num_retries=0,
@@ -72,7 +73,10 @@ async def adecision_completion(*, model, state, questions, api_key=None, timeout
                     error=litellm.AuthenticationError if response.status_code in (401,403) else litellm.RateLimitError if response.status_code in (402,429) else litellm.BadRequestError
                     raise error(message=message,model=model,llm_provider='openrouter',response=response)
                 data=response.json();break
-        validate_answers(data,questions)
+        try:validate_answers(data,questions)
+        except ValueError as error:
+            error.raw_response=data
+            raise
         if path:
             temporary=path.with_suffix('.'+uuid.uuid4().hex+'.tmp')
             temporary.write_text(json.dumps(data,ensure_ascii=False));temporary.replace(path)
