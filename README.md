@@ -438,3 +438,26 @@ latency, successful requests per second, and output tokens per second. Exact
 routes are important: a bare model name may use litlm's normal provider fallback
 chain. API keys are read from the existing provider environment variables and
 are never included in the result rows or report.
+
+### Typed Decisions API and ensembles
+
+For Jev, Perplexity Decider and other OpenRouter decision models, pass named typed questions. One request carries a state and all its questions; native probabilities and the returned model version remain in `result.data`.
+
+```python
+from litlm import complete, ensemble
+
+questions = {"eligible": {"type": "choice", "instructions": "Does the evidence establish usable training data?",
+                           "criteria": {"yes": None, "no": None, "unknown": None}}}
+result = complete("Source evidence ...", model="openrouter/perplexity/pplx-decider-v1.1-27b",
+                  decisions=questions)
+print(result.data["answers"])
+# Different question sets per state: complete([{state, questions}, ...], decisions=True, ...).
+combined = ensemble("Source evidence ...",
+                    ["openrouter/perplexity/pplx-decider-v1.1-27b", "openrouter/~typesafe/jev-latest"],
+                    decisions=questions, caching=True)
+print(combined.data["answers"], combined.data["agreement"])
+```
+
+The CLI supports `--decisions questions.json` for shared questions, or bare `--decisions` for JSONL `{ "state": ..., "questions": ... }` bundles. Use `-o results.jsonl` for checkpointed resume; question contents are part of checkpoint identity. State objects and image payloads pass through unchanged. Chat-only options are rejected. Native requests support key pools, pacing, timeouts, bounded retries and disk caching; cache hits have zero new billed cost.
+
+`ensemble()` / `aensemble()` average matching distributions with optional positive `weights`, retaining all member answers, usage and model versions. They return a result for a scalar or a list of results for a batch. Model batches run sequentially through the existing scheduler. A failed member makes that row's ensemble incomplete rather than averaging the remaining models; member results remain inspectable. Averages are convenience scores, not a guarantee of calibration or independent evidence. Rerun with caching to reuse successful calls.

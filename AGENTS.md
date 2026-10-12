@@ -82,3 +82,7 @@ data = complete(prompts, json=True, max_concurrency=16, on_result=save)  # strea
 - Compatibility matters. Existing users rely on `Text` behaving like `str`,
   `BatchResult` behaving like `list`, and the existing keyword arguments. Add
   options as new keywords with defaults that keep existing behavior.
+
+## Native decision models
+
+Use `complete(states, model="openrouter/...", decisions=questions)` for named noul/choice/score questions, or `decisions=True` for per-state `{state, questions}` bundles. The CLI has `--decisions [questions.json]`; use `-o` to checkpoint. Native answers stay in `.data`, including probabilities. `ensemble` / `aensemble` retain per-model decisions and flag disagreement or incomplete members; use caching when rerunning. These calls use `/api/alpha/decisions`, not chat completions.

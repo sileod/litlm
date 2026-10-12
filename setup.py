@@ -8,9 +8,10 @@ setup(
     long_description_content_type="text/markdown",
     author="Damien Sileo",
     url="https://github.com/sileod/litlm",
-    py_modules=["litlm", "litlm_providers", "litlm_cli"],
+    py_modules=["litlm", "litlm_providers", "litlm_cli", "litlm_decisions"],
     install_requires=[
         "litellm",
+        "httpx",
         "tqdm",          # Required for progress bars
         "requests",      # Required for fetching OpenRouter models
         "appdirs",       # Required for cross-platform cache paths

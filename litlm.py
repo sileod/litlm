@@ -19,6 +19,7 @@ import appdirs
 import os, logging, re, sys
 import time
 from litlm_providers import _fallback_models, _litellm_model
+from litlm_decisions import adecision_completion, validate_questions, ensemble, aensemble
 
 # Quiet LiteLLM's own noise (opt out with LITLM_QUIET=0). The warning filters are
 # scoped to pydantic/LiteLLM serialization messages; nothing else is changed.
@@ -642,6 +643,7 @@ async def acomplete(
     template: Optional[str] = None,
     choices: Optional[Sequence[str]] = None,
     adaptive_concurrency: bool = False,
+    decisions: Optional[Union[Dict[str, Any], bool]] = None,
     **kwargs: Any,
 ) -> Union[Text, Failure, BatchResult, Dict[str, Any], List[Any]]:
     """Complete one prompt or an ordered batch (async; ``complete`` is the sync wrapper).
@@ -687,6 +689,10 @@ async def acomplete(
         choices: Optional label set. The model is told to answer with one
             label and each result is normalized to exactly that label; replies
             with no or several labels become ``Failure`` items (resumable).
+        decisions: Named typed questions for the OpenRouter Decisions API. Inputs
+            become states rather than chat messages. Pass True for per-input
+            {state, questions} bundles. Native probabilities are in
+            result.data. Supports the usual batching, pacing, keys and resume.
         **kwargs: Additional LiteLLM/provider parameters.
 
     Returns:
@@ -697,6 +703,10 @@ async def acomplete(
         and ``batch.summary()`` for a one-line status. In a batch, replies that
         fail ``json``/``choices`` parsing are ``Failure`` items; a scalar raises.
     """
+    if decisions is not None:
+        if decisions is not True:validate_questions(decisions)
+        if not model.startswith('openrouter/') or fallbacks or system or choices or json or prompt_cache or cache_control:
+            raise ValueError('decisions requires one exact openrouter route and no chat-only options')
     if json and choices is not None:
         raise ValueError("json and choices cannot be combined")
     if adaptive_concurrency and (type(max_concurrency) is not int or max_concurrency <= 0):
@@ -728,23 +738,34 @@ async def acomplete(
     if caching: _ensure_cache()
     if json and "response_format" not in kwargs: kwargs["response_format"] = {"type": "json_object"}
 
-    # Normalize Inputs
-    if hasattr(inputs, "tolist"): inputs = inputs.tolist()
-    is_batch = True
-    if isinstance(inputs, str): reqs, is_batch = [[{"role": "user", "content": inputs}]], False
-    elif isinstance(inputs, dict): reqs, is_batch = [[inputs]], False
-    elif isinstance(inputs, list):
-        if not inputs: return []
-        if isinstance(inputs[0], str):
-            reqs = [[{"role": "user", "content": i}] for i in inputs]
-        elif isinstance(inputs[0], dict):
-            reqs, is_batch = [inputs], False
-        else:
-            reqs = [_messages(i) for i in inputs]
-    else: raise ValueError("Input must be string, list, dict, or pandas object.")
-    reqs = [_messages(r, system) for r in reqs]
-    if choices is not None:
-        reqs = [_with_instruction(r, _choices_instruction(choices)) for r in reqs]
+    # Typed states remain separate from chat messages, including JSON objects/images.
+    if decisions is not None:
+        if isinstance(inputs,list):reqs,is_batch=inputs,True
+        else:reqs,is_batch=[inputs],False
+        if not reqs:return []
+        if decisions is True:
+            for bundle in reqs:
+                if not isinstance(bundle,dict) or 'state' not in bundle or 'questions' not in bundle:
+                    raise ValueError('decisions=True requires state/questions bundles')
+                validate_questions(bundle['questions'])
+    else:
+        # Normalize Inputs
+        if hasattr(inputs, "tolist"): inputs = inputs.tolist()
+        is_batch = True
+        if isinstance(inputs, str): reqs, is_batch = [[{"role": "user", "content": inputs}]], False
+        elif isinstance(inputs, dict): reqs, is_batch = [[inputs]], False
+        elif isinstance(inputs, list):
+            if not inputs: return []
+            if isinstance(inputs[0], str):
+                reqs = [[{"role": "user", "content": i}] for i in inputs]
+            elif isinstance(inputs[0], dict):
+                reqs, is_batch = [inputs], False
+            else:
+                reqs = [_messages(i) for i in inputs]
+        else: raise ValueError("Input must be string, list, dict, or pandas object.")
+        reqs = [_messages(r, system) for r in reqs]
+        if choices is not None:
+            reqs = [_with_instruction(r, _choices_instruction(choices)) for r in reqs]
 
     call_id = len(_HISTORY)
 
@@ -762,7 +783,9 @@ async def acomplete(
                 reqs[index],
             )
             try:
-                if choices is not None:
+                if decisions is not None:
+                    result.data = response._litlm_decisions
+                elif choices is not None:
                     raw = str(result)
                     result = Text(str(match_choice(raw, choices)), response, call_id, reqs[index])
                     result.raw_text = raw
@@ -822,11 +845,16 @@ async def acomplete(
                         generation = adaptive.generation if adaptive else None
                         if debug:
                             print(f"litlm trying model: {m}")
-                        request = acompletion(
-                            model=_litellm_model(m), messages=r, caching=caching,
-                            num_retries=num_retries, max_tokens=max_tokens,
-                            timeout=timeout, **call_kwargs,
-                        )
+                        if decisions is not None:
+                            request = adecision_completion(model=m,state=r['state'] if decisions is True else r,
+                                questions=r['questions'] if decisions is True else decisions,
+                                num_retries=num_retries,timeout=timeout,cache_dir=CACHE_DIR if caching else None,**call_kwargs)
+                        else:
+                            request = acompletion(
+                                model=_litellm_model(m), messages=r, caching=caching,
+                                num_retries=num_retries, max_tokens=max_tokens,
+                                timeout=timeout, **call_kwargs,
+                            )
                         res = (
                             await asyncio.wait_for(request, timeout=attempt_timeout)
                             if attempt_timeout else await request
@@ -1007,6 +1035,7 @@ async def acomplete(
             "fallbacks": fallbacks,
             "choices": choices,
             "adaptive_concurrency": adaptive_concurrency,
+            "decisions": decisions,
             **kwargs,
         }
         res = BatchResult(res, resume_options=resume_options)
@@ -1043,6 +1072,7 @@ def complete(
     template: Optional[str] = None,
     choices: Optional[Sequence[str]] = None,
     adaptive_concurrency: bool = False,
+    decisions: Optional[Union[Dict[str, Any], bool]] = None,
     **kwargs: Any,
 ) -> Union[Text, Failure, BatchResult, Dict[str, Any], List[Any]]:
     args = dict(locals())

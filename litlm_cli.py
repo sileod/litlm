@@ -111,6 +111,8 @@ def _inputs(args, parser):
             values = [json.loads(line) for line in lines]
         except json.JSONDecodeError as error:
             parser.error(f"invalid JSONL input: {error}")
+        if args.decisions:
+            return values, True
         if all(isinstance(value, str) for value in values):
             return values, True
         if args.template:
@@ -148,6 +150,7 @@ def _parser():
     parser.add_argument("prompt", nargs="*", help="prompt text; stdin is used when omitted")
     parser.add_argument("-m", "--model", default=DEFAULT_MODEL)
     parser.add_argument("--system")
+    parser.add_argument("--decisions", nargs="?", const=True, type=Path, help="Optional JSON file of named questions; without a file, inputs are state/questions bundles")
     parser.add_argument("--json", action="store_true", help="request and parse JSON output")
     parser.add_argument("--output", choices=("text", "json", "jsonl"))
     parser.add_argument("--input-jsonl", action="store_true", help="read one JSON input per stdin line")
@@ -219,6 +222,7 @@ def _print(results, output, batch, fields=None):
 def _key(value, args):
     spec = [value, args.template, args.choices, args.system, args.json,
             args.model, args.max_tokens, args.temperature, args.reasoning_effort, args.fallbacks,
+            *([args.decisions] if args.decisions is not None else []),
             [param for param in args.param if param.split('=', 1)[0] not in {'api_key', 'api_key_envs'}]]
     blob = json.dumps(spec, sort_keys=True, ensure_ascii=False, default=str)
     return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:12]
@@ -304,6 +308,9 @@ def main(argv=None):
             print(f"litlm: {type(error).__name__}: {error}", file=sys.stderr)
             return 1
         return 0
+    if args.decisions and args.decisions is not True:
+        try:args.decisions=json.loads(args.decisions.read_text())
+        except (OSError,ValueError) as error:parser.error(str(error))
     inputs, batch = _inputs(args, parser)
     output = args.output or ("jsonl" if batch else "text")
 
@@ -314,6 +321,7 @@ def main(argv=None):
 
     call = dict(
         model=args.model,
+        decisions=args.decisions,
         system=args.system,
         json=args.json,
         show_progress=not args.no_progress and sys.stderr.isatty(),
